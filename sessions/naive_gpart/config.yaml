@@ -1,0 +1,18 @@
+# 模型設定
+model:
+  input_dim: 3
+  hidden_dim: 64
+  output_dim: 2
+  aggr: "mean"
+
+# 訓練參數
+train:
+  epochs: 1000
+  learning_rate: 0.00001
+  alpha: 1.0  # normalized cut loss 權重
+  beta: 14.5   # balance loss 權重
+
+# mlflow 設定
+mlflow:
+  tracking_uri: "http://localhost:6200"
+  experiment_name: "naive_gpart" 
