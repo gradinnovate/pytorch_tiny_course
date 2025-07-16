@@ -52,7 +52,7 @@ class GraphPartitionNet(nn.Module):
          
         x = self.conv2(x, edge_index)
         x = F.relu(x)
-        
+       
         x = self.conv3(x, edge_index)
         x = F.relu(x)
         x = self.conv4(x, edge_index)
