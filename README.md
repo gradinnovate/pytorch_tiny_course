@@ -1,3 +1,5 @@
+![Course Banner](img/banner.png)
+
 # Installation
 
 ## 1. 安裝 Python 3.11
