@@ -25,7 +25,7 @@ class MLFlowLogger:
 
 
 if __name__ == "__main__":
-    logger = MLFlowLogger(tracking_uri="http://localhost:6100", experiment_name="test_log")
+    logger = MLFlowLogger(tracking_uri="http://localhost:6210", experiment_name="test_log")
     logger.log_params({"lr": 0.00001})
     logger.log_loss(0.123, step=1)
     for epoch in range(10):

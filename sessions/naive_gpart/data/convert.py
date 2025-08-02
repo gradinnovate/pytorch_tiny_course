@@ -173,20 +173,20 @@ def parse_graph_file(file_path: str) -> Tuple[Data, np.ndarray]:
     f3_norm = torch.norm(f3, p='fro')
     f4_norm = torch.norm(f4, p='fro')
     if f1_norm > 0 and f2_norm > 0:
-        f1 = f1 / f1_norm * f2_norm
+        f1 =  f1 / f1_norm * f2_norm
     if f3_norm > 0 and f2_norm > 0:
         f3 = f3 / f3_norm * f2_norm
     if f4_norm > 0 and f2_norm > 0:
         f4 = f4 / f4_norm * f2_norm
 
-    x = torch.cat([f1, f2, f3], dim=1)
+    x = torch.cat([f1,f2,f3], dim=1)
 
     # Create and return the Data object
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     return data
 
 
-def generalized_eigen_features(edge_index, num_nodes=None, max_iter=10):
+def generalized_eigen_features(edge_index, num_nodes=None, max_iter=20):
     # Convert edge_index to numpy adjacency matrix
     if num_nodes is None:
         num_nodes = edge_index.max().item() + 1
@@ -223,8 +223,9 @@ def generalized_eigen_features(edge_index, num_nodes=None, max_iter=10):
         
         # Partition assignment: make 0/1 as balanced as possible
         idx = np.argsort(fiedler_vector)
-        partition = np.zeros_like(fiedler_vector, dtype=int)
-        partition[idx[len(idx)//2:]] = 1
+        partition = np.ones_like(fiedler_vector, dtype=int)
+        partition[idx[:len(idx)//2]] = 0
+    
         # Convert to torch tensor and reshape
         #x = torch.from_numpy(partition).float().reshape(-1, 1)
         x = torch.from_numpy(fiedler_vector).float().reshape(-1, 1)

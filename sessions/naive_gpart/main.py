@@ -64,7 +64,7 @@ def main():
         logger.log_loss(loss.item(), step=epoch)
         logger.log_metrics({'ncut': ncut, 'balance': bal}, step=epoch)
         if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
-            print(f"Epoch {epoch}, Loss: {loss.item():.4f}, ncut: {ncut:.4f}, balance: {bal:.4f}")
+            print(f"Epoch {epoch}, Loss: {loss.item():.4f}, ncut: {ncut:.4f}, balance: {bal:.2e}")
 
     logger.end()
 
