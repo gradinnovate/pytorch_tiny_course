@@ -37,11 +37,11 @@ OPENAI_API_KEY=your_api_key_here
 OPENAI_MODEL=gpt-4.1
 ```
 
-To test locally with an Ollama endpoint, use following settings:
+To test with Google Gemini models, use following settings:
 ```
-OPENAI_API_KEY=no_key_required
-OPENAI_MODEL=gemma3n:latest
-OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=gemini_api_key
+OPENAI_MODEL=gemini_model_name
+OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
 ```
 
 ### 3. Run Experiments
