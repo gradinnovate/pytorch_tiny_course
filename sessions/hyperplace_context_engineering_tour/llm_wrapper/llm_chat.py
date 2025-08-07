@@ -2,6 +2,7 @@ from openai import OpenAI
 import os
 import dotenv
 import logging
+import re
 
 # Load environment variables and define pricing constants
 dotenv.load_dotenv()
@@ -63,6 +64,22 @@ class LLMChat:
         self.client = OpenAI(**client_kwargs)
         self.conversation_history = []
         self.system_prompt = system_prompt
+    
+    def _clean_response(self, response_text):
+        """
+        Remove <think>...</think> tags from LLM response.
+        
+        Parameters:
+        -----------
+        response_text : str
+            The raw response from the LLM
+            
+        Returns:
+        --------
+        str
+            Cleaned response with thinking tags removed
+        """
+        return re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
         
     def _create_chat_completion(self, messages, temperature=0.7):
         """
@@ -95,7 +112,9 @@ class LLMChat:
             response.usage.completion_tokens
         )
         
-        return response.choices[0].message.content
+        # Clean the response to remove thinking tags
+        raw_content = response.choices[0].message.content
+        return self._clean_response(raw_content)
 
     def _prepare_messages(self, message):
         """
