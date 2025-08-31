@@ -116,5 +116,5 @@ class HypergraphRayleighQuotientLoss(nn.Module):
         
         # 最終的 Loss 是瑞利商加上正交性懲罰項
         # lambda 是一個超參數，用於平衡兩者
-        lambda_ortho = 1.0 
+        lambda_ortho = 0.1
         return loss + lambda_ortho * ortho_loss

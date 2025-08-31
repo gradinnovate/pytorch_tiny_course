@@ -1,48 +1,60 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HypergraphConv, BatchNorm
+from torch_geometric.nn import HypergraphConv, LayerNorm, BatchNorm
 
 class HypergraphModel(nn.Module):
-    def __init__(self, input_dim=1, hidden_dim=32, output_dim=1):
-        super(HypergraphModel, self).__init__()
-        
-        self.conv1 = HypergraphConv(input_dim, hidden_dim)
-        self.conv2 = HypergraphConv(hidden_dim, hidden_dim)
-        self.conv3 = HypergraphConv(hidden_dim, hidden_dim)
-        self.conv4 = HypergraphConv(hidden_dim, output_dim)
-        self.bn = BatchNorm(hidden_dim)
-        
-        # Xavier initialization
-        self._init_weights()
-        
-    def forward(self, x, hyperedge_index):
-        # First layer
-        x = self.conv1(x, hyperedge_index)
-        x = self.bn(x)
-        x = F.relu(x)
-        
-        # Second layer
-        x = self.conv2(x, hyperedge_index)
-        x = F.relu(x)
-        
-        # Third layer
-        x = self.conv3(x, hyperedge_index)
-        x = F.relu(x)
-        
-        x = self.conv4(x, hyperedge_index)
-        
-        return x
-    
-    def _init_weights(self):
-        """Initialize weights using Xavier/Glorot initialization"""
-        for module in self.modules():
-            if hasattr(module, 'weight') and module.weight is not None:
-                if len(module.weight.shape) > 1:  # Only for 2D+ tensors
-                    nn.init.xavier_uniform_(module.weight)
-            if hasattr(module, 'bias') and module.bias is not None:
-                nn.init.constant_(module.bias, 0)
+    """
+    一個為學習超圖頻譜嵌入而優化的、更穩健的 GNN 架構。
 
+    - 採用 2 層結構以避免過度平滑。
+    - 在每個隱藏層後使用 LayerNorm, LeakyReLU, 和 Dropout，確保訓練穩定性。
+    - 輸出層為線性，不加激活函數，適用於嵌入任務。
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.5):
+        super().__init__()
+        
+        # 第一層：輸入維度 -> 隱藏維度
+        self.conv1 = HypergraphConv(input_dim, hidden_dim)
+        self.norm1 = LayerNorm(hidden_dim)
+        
+       
+        self.conv2 = HypergraphConv(hidden_dim, hidden_dim)
+        self.conv3 = HypergraphConv(hidden_dim, output_dim)
+        
+        self.dropout = dropout
+
+        # 初始化權重
+        self._init_weights()
+
+    def forward(self, x: torch.Tensor, hyperedge_index: torch.Tensor) -> torch.Tensor:
+        # 第一層
+        x = self.conv1(x, hyperedge_index)
+        
+        x = self.norm1(x)
+        x = F.leaky_relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+       
+        x = self.conv2(x, hyperedge_index)
+        x = F.leaky_relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        z = self.conv3(x, hyperedge_index)
+        
+        
+        
+        return z
+
+    def _init_weights(self):
+        """使用 Xavier/Glorot 初始化權重"""
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                # 對於權重矩陣
+                if param.dim() > 1:
+                    nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                # 對於偏置項
+                nn.init.constant_(param, 0)
 
 if __name__ == "__main__":
     from hgr2indices import parse_hgr_file

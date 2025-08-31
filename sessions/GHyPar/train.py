@@ -1,16 +1,30 @@
 import torch
 import torch.optim as optim
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+from numba import jit, prange
 from hgr2indices import parse_hgr_file
 from hypergraph_model import HypergraphModel
-from loss_func import HypergraphRayleighQuotientLoss
+from loss_func2 import HypergraphRayleighQuotientLossDirect as HypergraphRayleighQuotientLoss
 
-def train_hypergraph_model(num_epochs=100, lr=0.01):
+def train_hypergraph_model(num_epochs=100, lr=0.01, seed=42):
     """
     Train hypergraph model on ibm01.hgr dataset with random noise as initial node features.
     """
+    # Set random seeds for reproducibility
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     # Set device to CPU (MPS has issues with cdist operation in loss function)
-    device = torch.device("cpu")
+    device = torch.device("mps")
     print(f"Using device: {device}")
+    print(f"Random seed: {seed}")
     
     # Load hypergraph data
     print("Loading hypergraph data...")
@@ -18,12 +32,43 @@ def train_hypergraph_model(num_epochs=100, lr=0.01):
     hyperedge_index = hyperedge_index.to(device)
     print(f"Loaded graph with {num_vertices} vertices and {num_hyperedges} hyperedges")
     
-    # Create model (output_dim=1 to match the loss function expectation)
-    model = HypergraphModel(input_dim=1, hidden_dim=16, output_dim=1).to(device)
+    # Load partition solution
+    print("Loading partition solution...")
+    with open("ibm01.part.2", "r") as f:
+        partition_ids = [int(line.strip()) for line in f.readlines()]
     
-    # Initialize node features with random noise
-    torch.manual_seed(42)  # For reproducibility
-    x = torch.randn(num_vertices, 1).to(device)
+    # Convert partition IDs: 1 -> 1, 0 -> -1
+    partition_ids = torch.tensor(partition_ids, dtype=torch.float)
+    partition_ids = torch.where(partition_ids == 0, -1.0, 1.0)
+    print(f"Loaded partition solution with {len(partition_ids)} nodes (converted 0->-1, 1->1)")
+    
+    # Create model (input_dim=2 for [node degree, partition_id] features)
+    model = HypergraphModel(input_dim=2, hidden_dim=32, output_dim=1).to(device)
+    
+    # Initialize node features with node degrees
+    node_degrees = torch.zeros(num_vertices, dtype=torch.float)
+    node_idx = hyperedge_index[0].cpu()
+    for node in node_idx:
+        node_degrees[node] += 1
+    
+    # Standardize node degrees (z-score normalization)
+    mean_degree = node_degrees.mean()
+    std_degree = node_degrees.std()
+    node_degrees_std = (node_degrees - mean_degree) / (std_degree + 1e-8)
+    
+    print(f"Node degree stats - Mean: {mean_degree:.2f}, Std: {std_degree:.2f}")
+    print(f"After standardization - Mean: {node_degrees_std.mean():.6f}, Std: {node_degrees_std.std():.6f}")
+    
+    # Normalize partition IDs to match standardized node degrees magnitude using 2-norm
+    # part_id_normalized = part_id / ||part_id||_2 * ||node_degrees_std||_2
+    partition_norm = torch.norm(partition_ids, p=2)
+    degree_norm = torch.norm(node_degrees, p=2)  # Use standardized degrees
+    partition_ids_normalized = (partition_ids / (partition_norm + 1e-8)) * degree_norm
+    
+    print(f"Partition ID norm: {partition_norm:.2f}, Standardized degree norm: {degree_norm:.2f}")
+        
+    # Combine features: [standardized_degrees, normalized_partition_ids]
+    x = torch.stack([partition_ids_normalized,node_degrees_std], dim=1).to(device)
     
     # Initialize loss function and optimizer
     criterion = HypergraphRayleighQuotientLoss()
@@ -58,68 +103,224 @@ def train_hypergraph_model(num_epochs=100, lr=0.01):
     return model, loss.item(), embeddings, hyperedge_index, num_vertices
 
 
-def partition_by_median(embeddings):
+def partition_by_balanced_cut(embeddings, hyperedge_index, node_weights=None, epsilon=0.02):
     """
-    Partition nodes into two equal groups based on sorted embedding values.
+    Partition nodes into balanced groups within epsilon constraint to minimize cut size.
+    Uses Numba for parallel acceleration.
     
     Args:
         embeddings: Node embeddings tensor of shape (num_nodes, 1)
+        hyperedge_index: Hypergraph edge index for cut size calculation
+        node_weights: Node weights (default: uniform weights)
+        epsilon: Balance constraint parameter
     
     Returns:
         partition: Binary partition tensor (0 or 1 for each node)
     """
     num_nodes = embeddings.shape[0]
-    sorted_indices = torch.argsort(embeddings.squeeze())
+    embeddings_flat = embeddings.flatten()
     
-    # Create equal partitions
-    partition = torch.zeros(num_nodes, dtype=torch.long)
-    partition[sorted_indices[num_nodes//2:]] = 1
+    # Convert to numpy for Numba
+    embeddings_np = embeddings_flat.cpu().numpy()
+    hyperedge_index_np = hyperedge_index.cpu().numpy()
     
-    return partition
+    # Use uniform weights if not provided
+    if node_weights is None:
+        node_weights = np.ones(num_nodes, dtype=np.float32)
+    else:
+        node_weights = node_weights.cpu().numpy()
+    
+    total_weight = node_weights.sum()
+    
+    # Balance constraint: (0.5 - epsilon) * W <= partition_weight <= (0.5 + epsilon) * W
+    min_weight = (0.5 - epsilon) * total_weight
+    max_weight = (0.5 + epsilon) * total_weight
+    
+    print(f"Total weight: {total_weight:.2f}")
+    print(f"Balance range: [{min_weight:.2f}, {max_weight:.2f}]")
+    
+    # Check embedding diversity
+    unique_values = np.unique(embeddings_np)
+    print(f"Embedding diversity: {len(unique_values)} unique values out of {num_nodes} nodes ({len(unique_values)/num_nodes*100:.1f}%)")
+    
+    # Sort nodes by embedding values
+    sorted_indices = np.argsort(embeddings_np)
+    
+    num_hyperedges = hyperedge_index_np[1].max() + 1
+    node_idx = hyperedge_index_np[0]
+    edge_idx = hyperedge_index_np[1]
+    
+    print("Finding valid splits...")
+    
+    # Find all valid splits first
+    valid_indices, valid_weights = find_valid_splits(
+        sorted_indices, node_weights, min_weight, max_weight, num_nodes
+    )
+    
+    if len(valid_indices) == 0:
+        print("Warning: No valid splits found within balance constraint, using median split")
+        partition = torch.zeros(num_nodes, dtype=torch.long)
+        partition[sorted_indices[num_nodes//2:]] = 1
+        return partition
+    
+    print(f"Found {len(valid_indices)} valid splits, evaluating cuts in parallel...")
+    
+    # Evaluate cut sizes in parallel
+    results = evaluate_cuts_parallel(
+        valid_indices, valid_weights, sorted_indices,
+        node_idx, edge_idx, num_hyperedges, num_nodes
+    )
+    
+    
+    print(f"Evaluated {len(results)} valid balanced splits")
+    
+    # Find best split (minimum cut size)
+    best_idx = np.argmin(results[:, 2])  # Column 2 is cut_size
+    best_split_idx = int(results[best_idx, 0])
+    best_weight = results[best_idx, 1]
+    best_cut_size = int(results[best_idx, 2])
+    
+    # Create best partition
+    best_partition = torch.zeros(num_nodes, dtype=torch.long)
+    for j in range(best_split_idx, num_nodes):
+        best_partition[sorted_indices[j]] = 1
+    
+    split_value = embeddings_np[sorted_indices[best_split_idx]]
+    
+    print(f"Best split at index {best_split_idx}, value: {split_value:.6f}")
+    print(f"Best split weight: {best_weight:.2f} (ratio: {best_weight/total_weight:.4f})")
+    print(f"Best cut size: {best_cut_size}")
+    
+    return best_partition
 
 
-def calculate_cut_size(partition, hyperedge_index, num_vertices):
+@jit(nopython=True)
+def calculate_cut_size_numba(partition, node_idx, edge_idx, num_hyperedges):
     """
-    Calculate cut size for hypergraph partitioning.
+    Numba-accelerated cut size calculation.
     
     Args:
-        partition: Binary partition tensor (0 or 1 for each node)
-        hyperedge_index: Hypergraph edge index
-        num_vertices: Number of vertices
+        partition: Binary partition array (0 or 1 for each node)
+        node_idx: Node indices from hyperedge_index[0]
+        edge_idx: Edge indices from hyperedge_index[1]
+        num_hyperedges: Total number of hyperedges
     
     Returns:
         cut_size: Number of hyperedges that are cut by the partition
     """
-    num_hyperedges = hyperedge_index[1].max() + 1
     cut_size = 0
     
-    node_idx, edge_idx = hyperedge_index
-    
     for e_idx in range(num_hyperedges):
-        # Get nodes in this hyperedge
-        nodes_in_edge = node_idx[edge_idx == e_idx]
+        # Find nodes in this hyperedge
+        has_partition_0 = False
+        has_partition_1 = False
         
-        if len(nodes_in_edge) > 0:
-            # Check if hyperedge spans both partitions
-            partitions_in_edge = partition[nodes_in_edge]
-            unique_partitions = torch.unique(partitions_in_edge)
-            
-            # If hyperedge contains nodes from both partitions, it's cut
-            if len(unique_partitions) > 1:
-                cut_size += 1
+        for i in range(len(edge_idx)):
+            if edge_idx[i] == e_idx:
+                node = node_idx[i]
+                if partition[node] == 0:
+                    has_partition_0 = True
+                else:
+                    has_partition_1 = True
+                
+                # Early exit if we found both partitions
+                if has_partition_0 and has_partition_1:
+                    cut_size += 1
+                    break
     
     return cut_size
 
+
+@jit(nopython=True)
+def find_valid_splits(sorted_indices, node_weights, min_weight, max_weight, num_nodes):
+    """
+    Find all valid splits within balance constraint.
+    
+    Returns:
+        valid_indices: Array of valid split indices
+        valid_weights: Array of corresponding weights
+    """
+    valid_indices = np.zeros(num_nodes, dtype=np.int32)
+    valid_weights = np.zeros(num_nodes, dtype=np.float32)
+    count = 0
+    
+    cumulative_weight = 0.0
+    
+    for i in range(num_nodes):
+        node_idx_val = sorted_indices[i]
+        cumulative_weight += node_weights[node_idx_val]
+        
+        if min_weight <= cumulative_weight <= max_weight:
+            valid_indices[count] = i
+            valid_weights[count] = cumulative_weight
+            count += 1
+    
+    return valid_indices[:count], valid_weights[:count]
+
+
+@jit(nopython=True, parallel=True)
+def evaluate_cuts_parallel(valid_indices, valid_weights, sorted_indices, 
+                          node_idx, edge_idx, num_hyperedges, num_nodes):
+    """
+    Parallel evaluation of cut sizes for valid splits.
+    
+    Returns:
+        results: Array of (split_idx, weight, cut_size)
+    """
+    num_splits = len(valid_indices)
+    results = np.zeros((num_splits, 3), dtype=np.float32)
+    
+    for idx in prange(num_splits):
+        split_idx = valid_indices[idx]
+        weight = valid_weights[idx]
+        
+        # Create partition for this split
+        partition = np.zeros(num_nodes, dtype=np.int32)
+        for j in range(split_idx, num_nodes):
+            partition[sorted_indices[j]] = 1
+        
+        # Calculate cut size
+        cut_size = calculate_cut_size_numba(partition, node_idx, edge_idx, num_hyperedges)
+        
+        results[idx, 0] = split_idx
+        results[idx, 1] = weight
+        results[idx, 2] = cut_size
+    
+    return results
+
+
+def calculate_cut_size(partition, hyperedge_index, num_vertices):
+    """
+    Calculate cut size for hypergraph partitioning (wrapper for compatibility).
+    """
+    if isinstance(partition, torch.Tensor):
+        partition = partition.numpy()
+    if isinstance(hyperedge_index, torch.Tensor):
+        hyperedge_index = hyperedge_index.numpy()
+    
+    num_hyperedges = hyperedge_index[1].max() + 1
+    node_idx = hyperedge_index[0]
+    edge_idx = hyperedge_index[1]
+    
+    return calculate_cut_size_numba(partition, node_idx, edge_idx, num_hyperedges)
+
 if __name__ == "__main__":
-    trained_model, final_loss, embeddings, hyperedge_index, num_vertices = train_hypergraph_model(num_epochs=500, lr=0.001)
+    # Set global seed at the beginning
+    SEED = 42
+    trained_model, final_loss, embeddings, hyperedge_index, num_vertices = train_hypergraph_model(num_epochs=1000, lr=0.00005, seed=SEED)
     print(f"Final loss: {final_loss:.6f}")
     
-    # Partition based on embedding median
-    print("\nPartitioning nodes based on embedding median...")
-    partition = partition_by_median(embeddings)
+    # Partition based on balanced cut optimization
+    print("\nPartitioning nodes with balanced cut optimization...")
+    print(f"Embedding stats - Min: {embeddings.min():.6f}, Max: {embeddings.max():.6f}, Median: {embeddings.median():.6f}")
+    print(f"Embedding std: {embeddings.std():.6f}")
     
-    # Calculate cut size
-    cut_size = calculate_cut_size(partition, hyperedge_index, num_vertices)
+    partition = partition_by_balanced_cut(embeddings, hyperedge_index, epsilon=0.02)
+    
+    # Calculate cut size (move data to CPU for calculation)
+    partition_cpu = partition.cpu()
+    hyperedge_index_cpu = hyperedge_index.cpu()
+    cut_size = calculate_cut_size(partition_cpu, hyperedge_index_cpu, num_vertices)
     
     # Print results
     partition_sizes = torch.bincount(partition)
@@ -127,3 +328,24 @@ if __name__ == "__main__":
     print(f"Cut size: {cut_size}")
     print(f"Total hyperedges: {hyperedge_index[1].max() + 1}")
     print(f"Cut ratio: {cut_size / (hyperedge_index[1].max() + 1):.4f}")
+    
+    # Plot embedding histogram
+    print("\nPlotting embedding histogram...")
+    embeddings_cpu = embeddings.cpu().numpy().flatten()
+    
+    plt.figure(figsize=(10, 6))
+    plt.hist(embeddings_cpu, bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Embedding Values')
+    plt.ylabel('Frequency')
+    plt.title('Distribution of Node Embeddings')
+    plt.grid(True, alpha=0.3)
+    
+    # Add vertical line at median
+    median_val = torch.median(embeddings.squeeze()).cpu().item()
+    plt.axvline(median_val, color='red', linestyle='--', linewidth=2, label=f'Median: {median_val:.4f}')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('embedding_histogram.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    print("Histogram saved as 'embedding_histogram.png'")

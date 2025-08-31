@@ -1,4 +1,68 @@
-### how to run
+# 基於神經網路的超圖分割
+
+本專案使用圖神經網路(GNNs)與基於瑞利商(Rayleigh quotient)的損失函數實現超圖分割。
+
+## 損失函數數學公式
+
+`loss_func2.py` 中的損失函數實現了**超圖瑞利商損失**，旨在最小化超圖分割的瑞利商。
+
+### 主要組件
+
+#### 1. 瑞利商
+對於具有節點嵌入 $Z \in \mathbb{R}^{n \times k}$ 的超圖，每個嵌入維度 $j$ 的瑞利商為：
+
+$$R_j = \frac{\text{分子}_j}{\text{分母}_j}$$
+
+其中：
+- **分子**: $\text{分子}_j = Z_j^T (D_v - H W D_e^{-1} H^T) Z_j$
+- **分母**: $\text{分母}_j = Z_j^T D_v Z_j$
+
+#### 2. 分子計算 (公式 152)
+分子使用高效的向量化形式計算：
+
+$$\text{分子}_j = 0.5 \times \sum_e \frac{w(e)}{\delta(e)} \times \sum_{u,v \in e} \|Y_u - Y_v\|^2$$
+
+其中：
+- $Y = D_v^{-1/2} Z$ (正規化節點嵌入)
+- $w(e)$ = 超邊 $e$ 的權重
+- $\delta(e)$ = 超邊 $e$ 的度數 (超邊 $e$ 中的節點數量)
+- 內層求和是對超邊 $e$ 中所有節點對 $u,v$ 求和
+
+#### 3. 向量化實現
+為了效率，成對距離和計算為：
+
+$$\sum_{u,v \in e} \|Y_u - Y_v\|^2 = 2 \cdot \delta(e) \cdot \sum_{u \in e} \|Y_u\|^2 - 2 \cdot \left\|\sum_{u \in e} Y_u\right\|^2$$
+
+#### 4. 最終損失函數
+
+$$\text{損失} = \frac{1}{k}\sum_{j=1}^k R_j + \lambda \cdot \|Z^T D_v Z - I\|_F$$
+
+其中：
+- $k$ = 嵌入維度
+- $\|Z^T D_v Z - I\|_F$ = 正交性懲罰項 (Frobenius 範數)
+- $\lambda$ = 正則化參數 (目前設為 0)
+
+### 關鍵數學定義
+
+- **節點度數矩陣**: $D_v[i] = \sum_{e: i \in e} w(e)$ 對所有包含節點 $i$ 的超邊 $e$
+- **超邊度數矩陣**: $D_e[e] = |e|$ (超邊 $e$ 的基數)  
+- **關聯矩陣**: $H[i,e] = 1$ 若節點 $i \in$ 超邊 $e$，否則為 0
+- **權重矩陣**: $W = \text{diag}(w(e))$ 對所有超邊 $e$
+
+### 目標
+最小化此損失函數會驅動 GNN 嵌入朝向正規化超圖拉普拉斯算子的最小特徵值對應的特徵向量，根據譜圖理論，這些向量對圖分割是最優的。
+
+## 模型架構
+- 3 層 HypergraphConv 網路
+- 輸入：節點度數作為初始特徵
+- 輸出：用於二元分割的 1 維嵌入
+- 激活函數：LeakyReLU
+- 正規化：LayerNorm
+
+## 分割方法
+訓練後，透過對嵌入進行排序並在中位數處分割來創建平衡分割。
+
+### How to run
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python3 train.py
+python3 train.py
 ```
