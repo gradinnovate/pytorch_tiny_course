@@ -1,46 +1,45 @@
 # 基於神經網路的超圖分割
 
-本專案使用圖神經網路(GNNs)與基於瑞利商(Rayleigh quotient)的損失函數實現超圖分割。
+本專案使用圖神經網路(GNNs)與基於歸一化超圖 Laplacian 廣義瑞利商的損失函數實現超圖分割。
 
 ## 損失函數數學公式
 
-`loss_func2.py` 中的損失函數實現了**超圖瑞利商損失**，旨在最小化超圖分割的瑞利商。
+`loss_func2.py` 中的損失函數實現了**歸一化超圖 Laplacian 廣義瑞利商損失**，結合對比學習增強性能。
 
 ### 主要組件
 
-#### 1. 瑞利商
-對於具有節點嵌入 $Z \in \mathbb{R}^{n \times k}$ 的超圖，每個嵌入維度 $j$ 的瑞利商為：
+#### 1. 歸一化超圖 Laplacian
+實現歸一化 Laplacian: $\Delta = I - \Theta$，其中：
 
-$$R_j = \frac{\text{分子}_j}{\text{分母}_j}$$
+$$\Theta = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}$$
+
+#### 2. 廣義瑞利商
+對於每個嵌入維度 $j$，廣義瑞利商為：
+
+$$R_j = \frac{f^T \Delta f}{f^T D_v f} = \frac{f^T D_v f - f^T \Theta f}{f^T D_v f} = 1 - \frac{f^T \Theta f}{f^T D_v f}$$
+
+其中 $f = Z_j$ 是第 $j$ 列嵌入向量。
+
+#### 3. $f^T \Theta f$ 的高效計算
+使用變分形式高效計算：
+
+$$f^T \Theta f = \sum_{e} \frac{w(e)}{\delta(e)} \times \left(\sum_{u \in e} D_v^{-1/2}[u] \cdot f[u]\right)^2$$
+
+#### 4. 對比學習損失
+當提供 hint partition 時，使用對比學習驗證 partition 品質：
+- **正樣本**: hint partition (已知的好分割)
+- **負樣本**: 隨機生成的 balanced partition
+- **相似度**: cosine similarity between predicted 和 reference partitions
+- **溫度縮放**: 使用溫度參數 $\tau = 0.1$ 進行 softmax 標準化
+
+#### 5. 最終損失函數
+
+$$\text{損失} = \text{瑞利商損失} + \lambda_c \cdot \text{對比損失} + \lambda_{KL} \cdot \text{KL散度}$$
 
 其中：
-- **分子**: $\text{分子}_j = Z_j^T (D_v - H W D_e^{-1} H^T) Z_j$
-- **分母**: $\text{分母}_j = Z_j^T D_v Z_j$
-
-#### 2. 分子計算 (公式 152)
-分子使用高效的向量化形式計算：
-
-$$\text{分子}_j = 0.5 \times \sum_e \frac{w(e)}{\delta(e)} \times \sum_{u,v \in e} \|Y_u - Y_v\|^2$$
-
-其中：
-- $Y = D_v^{-1/2} Z$ (正規化節點嵌入)
-- $w(e)$ = 超邊 $e$ 的權重
-- $\delta(e)$ = 超邊 $e$ 的度數 (超邊 $e$ 中的節點數量)
-- 內層求和是對超邊 $e$ 中所有節點對 $u,v$ 求和
-
-#### 3. 向量化實現
-為了效率，成對距離和計算為：
-
-$$\sum_{u,v \in e} \|Y_u - Y_v\|^2 = 2 \cdot \delta(e) \cdot \sum_{u \in e} \|Y_u\|^2 - 2 \cdot \left\|\sum_{u \in e} Y_u\right\|^2$$
-
-#### 4. 最終損失函數
-
-$$\text{損失} = \frac{1}{k}\sum_{j=1}^k R_j + \lambda \cdot \|Z^T D_v Z - I\|_F$$
-
-其中：
-- $k$ = 嵌入維度
-- $\|Z^T D_v Z - I\|_F$ = 正交性懲罰項 (Frobenius 範數)
-- $\lambda$ = 正則化參數 (目前設為 0)
+- 瑞利商損失 = $\frac{1}{k}\sum_{j=1}^k R_j$
+- $\lambda_c = 0.01$ (對比學習權重)
+- $\lambda_{KL} = 0.001$ (VAE KL 散度權重)
 
 ### 關鍵數學定義
 
