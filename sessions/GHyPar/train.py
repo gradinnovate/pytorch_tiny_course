@@ -18,8 +18,8 @@ def train_hypergraph_model(num_epochs=100, lr=0.01, seed=42):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    #torch.backends.cudnn.deterministic = True
+    #torch.backends.cudnn.benchmark = False
     
     # Set device to CPU (MPS has issues with cdist operation in loss function)
     device = torch.device("mps")
@@ -37,13 +37,23 @@ def train_hypergraph_model(num_epochs=100, lr=0.01, seed=42):
     with open("ibm01.part.2", "r") as f:
         partition_ids = [int(line.strip()) for line in f.readlines()]
     
+    # Calculate cut size of ground truth partition before conversion
+    ground_truth_partition = torch.tensor(partition_ids, dtype=torch.long)
+    ground_truth_cut_size = calculate_cut_size(ground_truth_partition, hyperedge_index.cpu(), num_vertices)
+    
+    # Print ground truth partition stats
+    ground_truth_sizes = torch.bincount(ground_truth_partition)
+    print(f"Ground truth partition sizes: {ground_truth_sizes[0].item()} | {ground_truth_sizes[1].item()}")
+    print(f"Ground truth cut size: {ground_truth_cut_size}")
+    print(f"Ground truth cut ratio: {ground_truth_cut_size / num_hyperedges:.4f}")
+    
     # Convert partition IDs: 1 -> 1, 0 -> -1
     partition_ids = torch.tensor(partition_ids, dtype=torch.float)
     partition_ids = torch.where(partition_ids == 0, -1.0, 1.0)
     print(f"Loaded partition solution with {len(partition_ids)} nodes (converted 0->-1, 1->1)")
     
-    # Create model (input_dim=2 for [node degree, partition_id] features)
-    model = HypergraphModel(input_dim=2, hidden_dim=32, output_dim=1).to(device)
+    # Create model (input_dim=3 for core features)
+    model = HypergraphModel(input_dim=3, hidden_dim=64, output_dim=1).to(device)
     
     # Initialize node features with node degrees
     node_degrees = torch.zeros(num_vertices, dtype=torch.float)
@@ -59,16 +69,45 @@ def train_hypergraph_model(num_epochs=100, lr=0.01, seed=42):
     print(f"Node degree stats - Mean: {mean_degree:.2f}, Std: {std_degree:.2f}")
     print(f"After standardization - Mean: {node_degrees_std.mean():.6f}, Std: {node_degrees_std.std():.6f}")
     
-    # Normalize partition IDs to match standardized node degrees magnitude using 2-norm
-    # part_id_normalized = part_id / ||part_id||_2 * ||node_degrees_std||_2
-    partition_norm = torch.norm(partition_ids, p=2)
-    degree_norm = torch.norm(node_degrees, p=2)  # Use standardized degrees
-    partition_ids_normalized = (partition_ids / (partition_norm + 1e-8)) * degree_norm
-    
-    print(f"Partition ID norm: {partition_norm:.2f}, Standardized degree norm: {degree_norm:.2f}")
+    # Use more sophisticated normalization: Min-Max + Standardization
+    def robust_normalize(feature, target_norm=None):
+        # First apply min-max normalization to [0, 1] 
+        min_val = feature.min()
+        max_val = feature.max()
+        if max_val > min_val:
+            feature_minmax = (feature - min_val) / (max_val - min_val)
+        else:
+            feature_minmax = feature.clone()
         
-    # Combine features: [standardized_degrees, normalized_partition_ids]
-    x = torch.stack([partition_ids_normalized,node_degrees_std], dim=1).to(device)
+        # Then apply z-score standardization
+        mean_val = feature_minmax.mean()
+        std_val = feature_minmax.std()
+        feature_std = (feature_minmax - mean_val) / (std_val + 1e-8)
+        
+        # Optionally scale to match target norm
+        if target_norm is not None:
+            current_norm = torch.norm(feature_std, p=2)
+            feature_std = (feature_std / (current_norm + 1e-8)) * target_norm
+            
+        return feature_std
+    
+    # Apply robust normalization to base features
+    degree_norm = torch.norm(node_degrees_std, p=2)  # Use as reference norm
+    partition_ids_normalized = robust_normalize(partition_ids, degree_norm)
+    
+    node_indices = torch.arange(num_vertices, dtype=torch.float)
+    node_indices_normalized = robust_normalize(node_indices, degree_norm)
+    
+    print(f"Degree reference norm: {degree_norm:.2f}")
+    print(f"Partition ID range: [{partition_ids_normalized.min():.3f}, {partition_ids_normalized.max():.3f}]")
+    print(f"Node indices range: [{node_indices_normalized.min():.3f}, {node_indices_normalized.max():.3f}]")
+    
+    # Combine the 3 core features with optimized ordering: [partition_ids, node_degrees, node_indices]
+    x = torch.stack([
+        partition_ids_normalized,  # Most important: ground truth signal
+        node_degrees_std,          # Second: topology structure  
+        node_indices_normalized    # Third: positional information
+    ], dim=1).to(device)
     
     # Initialize loss function and optimizer
     criterion = HypergraphRayleighQuotientLoss()
@@ -308,7 +347,7 @@ def calculate_cut_size(partition, hyperedge_index, num_vertices):
 if __name__ == "__main__":
     # Set global seed at the beginning
     SEED = 42
-    trained_model, final_loss, embeddings, hyperedge_index, num_vertices = train_hypergraph_model(num_epochs=1000, lr=0.00005, seed=SEED)
+    trained_model, final_loss, embeddings, hyperedge_index, num_vertices = train_hypergraph_model(num_epochs=500, lr=0.000025, seed=SEED)
     print(f"Final loss: {final_loss:.6f}")
     
     # Partition based on balanced cut optimization

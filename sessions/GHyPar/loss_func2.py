@@ -5,17 +5,14 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
     """
     直接優化超圖瑞利商的 Loss Function。
 
-    這個 Loss Function 最小化 GNN 輸出 Z 的每一列對應的瑞利商之和，
-    同時加入一個正交性懲罰項，以確保嵌入維度之間的多樣性。
-    Loss = mean(Quotients) + lambda * Ortho_Penalty
+    這個 Loss Function 最小化 GNN 輸出 Z 的每一列對應的瑞利商之和。
+    Loss = mean(Quotients)
     """
-    def __init__(self, lambda_ortho: float = 1.0):
+    def __init__(self):
         """
-        Args:
-            lambda_ortho (float, optional): 控制正交性懲罰項強度的超參數。 Defaults to 1.0.
+        直接優化超圖瑞利商的 Loss Function，不包含正交性懲罰項。
         """
         super().__init__()
-        self.lambda_ortho = lambda_ortho
 
     def _calculate_numerator_per_col(self, y_col: torch.Tensor, 
                                      hyperedge_index: torch.Tensor,
@@ -116,22 +113,7 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
         epsilon = 1e-8
         rayleigh_quotients = numerators / (denominators + epsilon)
         
-        # 主要損失是所有瑞利商的均值 (或總和)
-        main_loss = torch.mean(rayleigh_quotients)
+        # 損失是所有瑞利商的均值
+        loss = torch.mean(rayleigh_quotients)
         
-        variance_penalty = -torch.var(Z) 
-
-
-        # --- 步驟 3: 計算正交性懲罰 ---
-        # 目標是讓 Z^T * D_v * Z 接近單位矩陣 I
-        I = torch.eye(k, device=Z.device)
-        
-        # 計算 Z^T * D_v * Z
-        Z_T_Dv_Z = Z.T @ (Z * Dv.unsqueeze(1))
-        
-        ortho_loss = torch.norm(Z_T_Dv_Z - I, p='fro')
-
-        # --- 步驟 4: 組合 Loss ---
-        total_loss = main_loss
-        
-        return total_loss
+        return loss
