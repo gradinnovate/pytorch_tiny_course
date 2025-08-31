@@ -143,7 +143,8 @@ def partition_by_balanced_cut(embeddings, hyperedge_index, node_weights=None, ep
     unique_values = np.unique(embeddings_np)
     print(f"Embedding diversity: {len(unique_values)} unique values out of {num_nodes} nodes ({len(unique_values)/num_nodes*100:.1f}%)")
     
-    # Sort nodes by embedding values
+    # 
+    # nodes by embedding values
     sorted_indices = np.argsort(embeddings_np)
     
     num_hyperedges = hyperedge_index_np[1].max() + 1
@@ -152,27 +153,25 @@ def partition_by_balanced_cut(embeddings, hyperedge_index, node_weights=None, ep
     
     print("Finding valid splits...")
     
-    # Find all valid splits first
-    valid_indices, valid_weights = find_valid_splits(
+    # First step: find all valid splits
+    candidate_splits = find_valid_splits(
         sorted_indices, node_weights, min_weight, max_weight, num_nodes
     )
     
-    if len(valid_indices) == 0:
+    if candidate_splits.shape[0] == 0:
         print("Warning: No valid splits found within balance constraint, using median split")
         partition = torch.zeros(num_nodes, dtype=torch.long)
         partition[sorted_indices[num_nodes//2:]] = 1
         return partition
     
-    print(f"Found {len(valid_indices)} valid splits, evaluating cuts in parallel...")
+    print(f"Found {candidate_splits.shape[0]} valid splits, evaluating cut sizes in parallel...")
     
-    # Evaluate cut sizes in parallel
+    # Second step: evaluate cut sizes in parallel
     results = evaluate_cuts_parallel(
-        valid_indices, valid_weights, sorted_indices,
-        node_idx, edge_idx, num_hyperedges, num_nodes
+        candidate_splits, sorted_indices, node_idx, edge_idx, num_hyperedges, num_nodes
     )
     
-    
-    print(f"Evaluated {len(results)} valid balanced splits")
+    print(f"Evaluated {results.shape[0]} valid balanced splits")
     
     # Find best split (minimum cut size)
     best_idx = np.argmin(results[:, 2])  # Column 2 is cut_size
@@ -234,16 +233,12 @@ def calculate_cut_size_numba(partition, node_idx, edge_idx, num_hyperedges):
 @jit(nopython=True)
 def find_valid_splits(sorted_indices, node_weights, min_weight, max_weight, num_nodes):
     """
-    Find all valid splits within balance constraint.
+    Find all valid splits that satisfy balance constraints.
     
     Returns:
-        valid_indices: Array of valid split indices
-        valid_weights: Array of corresponding weights
+        results: Array of (split_idx, weight) for valid splits
     """
-    valid_indices = np.zeros(num_nodes, dtype=np.int32)
-    valid_weights = np.zeros(num_nodes, dtype=np.float32)
-    count = 0
-    
+    valid_splits = []
     cumulative_weight = 0.0
     
     for i in range(num_nodes):
@@ -251,28 +246,34 @@ def find_valid_splits(sorted_indices, node_weights, min_weight, max_weight, num_
         cumulative_weight += node_weights[node_idx_val]
         
         if min_weight <= cumulative_weight <= max_weight:
-            valid_indices[count] = i
-            valid_weights[count] = cumulative_weight
-            count += 1
+            valid_splits.append((i, cumulative_weight))
     
-    return valid_indices[:count], valid_weights[:count]
+    # Convert to numpy array
+    if len(valid_splits) == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    
+    results = np.zeros((len(valid_splits), 2), dtype=np.float64)
+    for idx in range(len(valid_splits)):
+        results[idx, 0] = valid_splits[idx][0]
+        results[idx, 1] = valid_splits[idx][1]
+    
+    return results
 
 
 @jit(nopython=True, parallel=True)
-def evaluate_cuts_parallel(valid_indices, valid_weights, sorted_indices, 
-                          node_idx, edge_idx, num_hyperedges, num_nodes):
+def evaluate_cuts_parallel(candidate_splits, sorted_indices, node_idx, edge_idx, num_hyperedges, num_nodes):
     """
-    Parallel evaluation of cut sizes for valid splits.
+    Parallel evaluation of cut sizes for candidate splits.
     
     Returns:
         results: Array of (split_idx, weight, cut_size)
     """
-    num_splits = len(valid_indices)
-    results = np.zeros((num_splits, 3), dtype=np.float32)
+    num_candidates = candidate_splits.shape[0]
+    results = np.zeros((num_candidates, 3), dtype=np.float64)
     
-    for idx in prange(num_splits):
-        split_idx = valid_indices[idx]
-        weight = valid_weights[idx]
+    for idx in prange(num_candidates):
+        split_idx = int(candidate_splits[idx, 0])
+        weight = candidate_splits[idx, 1]
         
         # Create partition for this split
         partition = np.zeros(num_nodes, dtype=np.int32)

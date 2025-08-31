@@ -36,9 +36,6 @@ class HypergraphModel(nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
         
        
-        x = self.conv2(x, hyperedge_index)
-        x = F.leaky_relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
         z = self.conv3(x, hyperedge_index)
         
         
