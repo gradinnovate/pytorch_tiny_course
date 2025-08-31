@@ -1,124 +1,112 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-class HypergraphRayleighQuotientLoss(nn.Module):
+class HypergraphRayleighQuotientLossDirect(nn.Module):
     """
-    重新設計的超圖瑞利商損失函數，拆分為兩個項。
-    
-    實現瑞利商: R_j = (expansion_term - cut_term) / (Z_j^T Z_j)
-    其中:
-    - expansion_term = Z_j^T D_v Z_j (鼓勵節點分散)
-    - cut_term = Z_j^T H W D_e^{-1} H^T Z_j (懲罰割邊)
+    基於 NIPS 論文的歸一化超圖 Laplacian 標準瑞利商 Loss Function。
+
+    實現歸一化 Laplacian: ∆ = I - Θ, 其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+    標準瑞利商: f^T ∆ f / f^T f = (f^T f - f^T Θ f) / f^T f
+    Loss = mean(Quotients)
     """
-    
-    def __init__(self, alpha: float = 1.0, beta: float = 1.0):
+    def __init__(self):
         """
-        Args:
-            alpha: expansion term 的權重
-            beta: cut term 的權重
+        直接優化超圖瑞利商的 Loss Function，不包含正交性懲罰項。
         """
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
 
-    def _calculate_expansion_term(self, z_col: torch.Tensor, Dv: torch.Tensor) -> torch.Tensor:
+    def _calculate_theta_quadratic_form(self, f: torch.Tensor, 
+                                        hyperedge_index: torch.Tensor,
+                                        hyperedge_weight: torch.Tensor,
+                                        De: torch.Tensor,
+                                        Dv_inv_sqrt: torch.Tensor) -> torch.Tensor:
         """
-        計算 expansion term: Z_j^T D_v Z_j
-        鼓勵節點在不同分割中分散
-        """
-        # Z_j^T D_v Z_j = sum_i D_v[i] * z_i^2
-        expansion = torch.sum(Dv * z_col.squeeze()**2)
-        return expansion
-    
-    def _calculate_cut_term(self, z_col: torch.Tensor, 
-                           hyperedge_index: torch.Tensor,
-                           hyperedge_weight: torch.Tensor,
-                           De: torch.Tensor) -> torch.Tensor:
-        """
-        計算 cut term: Z_j^T H W D_e^{-1} H^T Z_j
-        等價於公式 (152) 中的 0.5 * sum_{e} (w(e)/delta(e)) * sum_{u,v in e} ||z_u - z_v||^2
+        計算 f^T Θ f，其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+        
+        使用變分形式高效計算:
+        f^T Θ f = sum_{e} w(e)/δ(e) * (sum_{u∈e} D_v^{-1/2}[u] * f[u])^2
         """
         node_idx, edge_idx = hyperedge_index
         num_hyperedges = De.shape[0]
         
-        # 計算每個超邊內節點對的差值平方和
-        # sum_{u,v in e} ||z_u - z_v||^2 = 2 * |e| * sum_{u in e} ||z_u||^2 - 2 * ||sum_{u in e} z_u||^2
+        # 計算歸一化後的節點值: D_v^{-1/2} * f
+        normalized_f = Dv_inv_sqrt * f
         
-        # 計算每個超邊內節點嵌入的和: sum_{u in e} z_u
-        z_sum_per_edge = torch.zeros((num_hyperedges, 1), device=z_col.device)
-        z_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), z_col[node_idx])
+        # 對每個超邊 e，計算 sum_{u∈e} D_v^{-1/2}[u] * f[u]
+        weighted_sum_per_edge = torch.zeros((num_hyperedges, 1), device=f.device)
+        weighted_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), normalized_f[node_idx])
+        
+        # 計算 f^T Θ f = sum_{e} w(e)/δ(e) * (sum_{u∈e} D_v^{-1/2}[u] * f[u])^2
+        theta_quadratic_form = torch.sum(
+            hyperedge_weight.unsqueeze(1) * weighted_sum_per_edge.pow(2) / De.unsqueeze(1)
+        )
+        
+        return theta_quadratic_form
 
-        # 計算每個超邊內節點嵌入平方的和: sum_{u in e} ||z_u||^2
-        z_sq_sum_per_edge = torch.zeros((num_hyperedges, 1), device=z_col.device)
-        z_sq_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), z_col[node_idx]**2)
-        
-        # 組合公式: delta(e) * sum ||z_u||^2 - ||sum z_u||^2
-        term_per_edge = De.unsqueeze(1) * z_sq_sum_per_edge - z_sum_per_edge**2
-        
-        # 乘以權重 w(e)/delta(e) 並求和，再乘以 0.5
-        cut_term = 0.5 * torch.sum(hyperedge_weight.unsqueeze(1) * term_per_edge / De.unsqueeze(1))
-        
-        return cut_term
 
     def forward(self, Z: torch.Tensor, hyperedge_index: torch.Tensor, 
                 num_nodes: int, hyperedge_weight: torch.Tensor = None) -> torch.Tensor:
         """
-        計算重新設計的瑞利商損失。
+        計算 Loss。
 
         Args:
-            Z: GNN 輸出的節點嵌入, shape (num_nodes, k)
-            hyperedge_index: 超圖的關聯索引
-            num_nodes: 圖中的節點數量
-            hyperedge_weight: 超邊的權重 (可選)
+            Z (torch.Tensor): GNN 輸出的節點嵌入, shape 為 (num_nodes, k)。
+            hyperedge_index (torch.Tensor): 超圖的關聯索引。
+            num_nodes (int): 圖中的節點數量。
+            hyperedge_weight (torch.Tensor, optional): 超邊的權重。
 
         Returns:
-            torch.Tensor: 標量損失值
+            torch.Tensor: 一個標量 (scalar) 的 Loss 值。
         """
         k = Z.shape[1]
         node_idx, edge_idx = hyperedge_index
         num_hyperedges = (edge_idx.max() + 1).item()
 
-        # 設置默認權重
+        # --- 步驟 1: 預計算節點度和超邊度 ---
         if hyperedge_weight is None:
             hyperedge_weight = torch.ones(num_hyperedges, device=Z.device)
         
-        # 計算節點度 D_v
         edge_weights_expanded = hyperedge_weight[edge_idx]
+        
         Dv = torch.zeros(num_nodes, device=Z.device)
         Dv.scatter_add_(0, node_idx, edge_weights_expanded)
         
-        # 計算超邊度 D_e
         De = torch.zeros(num_hyperedges, device=Z.device)
         De.scatter_add_(0, edge_idx, torch.ones_like(edge_idx, dtype=torch.float))
 
-        # 處理度為0的情況
+        # 處理度為0的孤立點/邊，避免除以零
         Dv[Dv == 0] = 1.0
         De[De == 0] = 1.0
         
-        # 正規化 Z 使每一列的分母為 1 (Z_j^T Z_j = 1)
-        Z_normalized = F.normalize(Z, p=2, dim=0)  # 按列正規化，使每列的L2範數為1
+        # --- 步驟 2: 計算歸一化超圖 Laplacian 標準瑞利商 ---
+        # 歸一化 Laplacian: ∆ = I - Θ, 其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+        # 標準瑞利商: f^T ∆ f / f^T f = (f^T f - f^T Θ f) / f^T f
         
-        # 分別計算兩個損失項
-        expansion_terms = []
-        cut_terms = []
+        # 預計算 D_v^{-1/2}
+        Dv_inv_sqrt = Dv.pow(-0.5).unsqueeze(1)
+        
+        rayleigh_quotients = []
         
         for j in range(k):
-            z_col = Z_normalized[:, j:j+1]  # shape: (num_nodes, 1)
+            f = Z[:, j:j+1]  # 當前列向量
             
-            # 計算 expansion term: Z_j^T D_v Z_j
-            expansion = self._calculate_expansion_term(z_col, Dv)
-            expansion_terms.append(expansion)
+            # 計算 f^T f (L2 norm squared)
+            f_norm_squared = torch.sum(f.pow(2))
             
-            # 計算 cut term: Z_j^T H W D_e^{-1} H^T Z_j
-            cut = self._calculate_cut_term(z_col, hyperedge_index, hyperedge_weight, De)
-            cut_terms.append(cut)
+            # 計算 f^T Θ f
+            theta_quad_form = self._calculate_theta_quadratic_form(
+                f, hyperedge_index, hyperedge_weight, De, Dv_inv_sqrt
+            )
+            
+            # 標準瑞利商: f^T ∆ f / f^T f = (f^T f - f^T Θ f) / f^T f
+            # = 1 - (f^T Θ f / f^T f)
+            epsilon = 1e-8
+            rayleigh_quotient = 1.0 - theta_quad_form / (f_norm_squared + epsilon)
+            rayleigh_quotients.append(rayleigh_quotient)
         
-        expansion_terms = torch.stack(expansion_terms)
-        cut_terms = torch.stack(cut_terms)
+        rayleigh_quotients = torch.stack(rayleigh_quotients)
         
-        # 組合損失: alpha * expansion - beta * cut
-        # 我們要最小化 expansion 但最大化 cut (即最小化 -cut)
-        loss = self.alpha * torch.mean(expansion_terms) - self.beta * torch.mean(cut_terms)
+        # 損失是所有瑞利商的均值
+        loss = torch.mean(rayleigh_quotients)
         
         return loss

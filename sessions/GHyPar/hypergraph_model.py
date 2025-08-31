@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 from torch_geometric.nn import HypergraphConv, LayerNorm, BatchNorm
 
 class HypergraphModel(nn.Module):
@@ -12,7 +13,7 @@ class HypergraphModel(nn.Module):
     - 輸出層為線性，不加激活函數，適用於嵌入任務。
     - 包含可學習的 mask token，訓練時隨機遮蔽節點特徵以增強泛化能力。
     """
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.5, mask_prob: float = 0.1):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.5, mask_prob: float = 0.0):
         super().__init__()
         
         # 第一層：輸入維度 -> 隱藏維度
@@ -22,8 +23,14 @@ class HypergraphModel(nn.Module):
        
         self.conv2 = HypergraphConv(hidden_dim, hidden_dim)
         self.conv3 = HypergraphConv(hidden_dim, hidden_dim)
-        self.conv4 = HypergraphConv(hidden_dim, hidden_dim)
-        self.conv5 = HypergraphConv(hidden_dim, output_dim)
+        
+        # MLP decoder for better representation learning
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
        
         self.dropout = dropout
         self.mask_prob = mask_prob
@@ -58,11 +65,10 @@ class HypergraphModel(nn.Module):
         
         x = self.conv3(x, hyperedge_index)
         x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
         
-        
-        x = self.conv4(x, hyperedge_index)
-        x = F.relu(x)
-        z = self.conv5(x, hyperedge_index)
+        # Apply MLP decoder
+        z = self.decoder(x)
         
         
         

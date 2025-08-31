@@ -3,9 +3,10 @@ import torch.nn as nn
 
 class HypergraphRayleighQuotientLossDirect(nn.Module):
     """
-    直接優化超圖瑞利商的 Loss Function。
+    基於 NIPS 論文的歸一化超圖 Laplacian 廣義瑞利商 Loss Function。
 
-    這個 Loss Function 最小化 GNN 輸出 Z 的每一列對應的瑞利商之和。
+    實現歸一化 Laplacian: ∆ = I - Θ, 其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+    廣義瑞利商: f^T ∆ f / f^T D_v f = (f^T D_v f - f^T Θ f) / f^T D_v f
     Loss = mean(Quotients)
     """
     def __init__(self):
@@ -14,40 +15,33 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
         """
         super().__init__()
 
-    def _calculate_numerator_per_col(self, y_col: torch.Tensor, 
-                                     hyperedge_index: torch.Tensor,
-                                     hyperedge_weight: torch.Tensor,
-                                     De: torch.Tensor) -> torch.Tensor:
+    def _calculate_theta_quadratic_form(self, f: torch.Tensor, 
+                                        hyperedge_index: torch.Tensor,
+                                        hyperedge_weight: torch.Tensor,
+                                        De: torch.Tensor,
+                                        Dv_inv_sqrt: torch.Tensor) -> torch.Tensor:
         """
-        為單個嵌入向量 y_col (對應論文中的 f) 計算瑞利商的分子。
-        分子 = 0.5 * sum_{e} w(e)/delta(e) * sum_{u,v in e} ||y_u - y_v||^2
+        計算 f^T Θ f，其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+        
+        使用變分形式高效計算:
+        f^T Θ f = sum_{e} w(e)/δ(e) * (sum_{u∈e} D_v^{-1/2}[u] * f[u])^2
         """
         node_idx, edge_idx = hyperedge_index
         num_hyperedges = De.shape[0]
         
-        # 這是論文公式 (152) 的直接實現
-        # 為了效率，這裡使用向量化操作而非 Python for 迴圈
+        # 計算歸一化後的節點值: D_v^{-1/2} * f
+        normalized_f = Dv_inv_sqrt * f
         
-        # 1. 計算每個節點在超邊內的差值平方和
-        # 對於每個超邊e, sum_{u,v in e} ||y_u - y_v||^2 可以被高效計算為:
-        # 2 * |e| * sum_{u in e} ||y_u||^2 - 2 * ||sum_{u in e} y_u||^2
+        # 對每個超邊 e，計算 sum_{u∈e} D_v^{-1/2}[u] * f[u]
+        weighted_sum_per_edge = torch.zeros((num_hyperedges, 1), device=f.device)
+        weighted_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), normalized_f[node_idx])
         
-        # sum_{u in e} y_u
-        y_sum_per_edge = torch.zeros((num_hyperedges, 1), device=y_col.device)
-        y_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), y_col[node_idx])
-
-        # sum_{u in e} ||y_u||^2
-        y_sq_sum_per_edge = torch.zeros((num_hyperedges, 1), device=y_col.device)
-        y_sq_sum_per_edge.scatter_add_(0, edge_idx.unsqueeze(1), y_col[node_idx]**2)
+        # 計算 f^T Θ f = sum_{e} w(e)/δ(e) * (sum_{u∈e} D_v^{-1/2}[u] * f[u])^2
+        theta_quadratic_form = torch.sum(
+            hyperedge_weight.unsqueeze(1) * weighted_sum_per_edge.pow(2) / De.unsqueeze(1)
+        )
         
-        # 2. 組合起來
-        # delta(e) * sum ||y_u||^2 - ||sum y_u||^2
-        term_per_edge = De.unsqueeze(1) * y_sq_sum_per_edge - y_sum_per_edge**2
-        
-        # 3. 乘以權重 w(e)/delta(e) 並加總
-        numerator = torch.sum(hyperedge_weight.unsqueeze(1) * term_per_edge / De.unsqueeze(1))
-        
-        return numerator
+        return theta_quadratic_form
 
 
     def forward(self, Z: torch.Tensor, hyperedge_index: torch.Tensor, 
@@ -84,34 +78,33 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
         Dv[Dv == 0] = 1.0
         De[De == 0] = 1.0
         
-        # --- 步驟 2: 計算瑞利商 ---
-        # 根據論文 f 和 r 的關係，我們需要對 Z 進行 D_v 加權
-        # 完整的瑞利商是 r^T(D_v - HWD_e^{-1}H^T)r / (r^T D_v r)
-        # GNN的輸出 Z 對應於 r。
+        # --- 步驟 2: 計算歸一化超圖 Laplacian 廣義瑞利商 ---
+        # 歸一化 Laplacian: ∆ = I - Θ, 其中 Θ = D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+        # 廣義瑞利商: f^T ∆ f / f^T D_v f = (f^T D_v f - f^T Θ f) / f^T D_v f
         
-        # 分子: Numerator = Z^T * (D_v - HWD_e^{-1}H^T) * Z
-        # 我們使用論文公式 (152) 的等價形式來計算分子，這樣更高效
-        # 注意需要對Z的每一列單獨計算
-        
-        numerators = []
-        # y_col 對應論文中的 f 向量
+        # 預計算 D_v^{-1/2}
         Dv_inv_sqrt = Dv.pow(-0.5).unsqueeze(1)
-        Y = Dv_inv_sqrt * Z
+        
+        rayleigh_quotients = []
         
         for j in range(k):
-            # 為Z的每一列計算分子
-            numerators.append(self._calculate_numerator_per_col(
-                Y[:, j:j+1], hyperedge_index, hyperedge_weight, De
-            ))
-        numerators = torch.stack(numerators)
-
-        # 分母: Denominator = Z^T * D_v * Z
-        # 我們需要的是對角線上的元素，即每個 z_j^T * D_v * z_j
-        denominators = torch.sum(Z.pow(2) * Dv.unsqueeze(1), dim=0)
-
-        # 為避免除以零，加入一個極小值
-        epsilon = 1e-8
-        rayleigh_quotients = numerators / (denominators + epsilon)
+            f = Z[:, j:j+1]  # 當前列向量
+            
+            # 計算 f^T D_v f (廣義內積)
+            f_Dv_f = torch.sum(f.pow(2) * Dv.unsqueeze(1))
+            
+            # 計算 f^T Θ f
+            theta_quad_form = self._calculate_theta_quadratic_form(
+                f, hyperedge_index, hyperedge_weight, De, Dv_inv_sqrt
+            )
+            
+            # 廣義瑞利商: f^T ∆ f / f^T D_v f = (f^T D_v f - f^T Θ f) / f^T D_v f
+            # = 1 - (f^T Θ f / f^T D_v f)
+            epsilon = 1e-8
+            rayleigh_quotient = 1.0 - theta_quad_form / (f_Dv_f + epsilon)
+            rayleigh_quotients.append(rayleigh_quotient)
+        
+        rayleigh_quotients = torch.stack(rayleigh_quotients)
         
         # 損失是所有瑞利商的均值
         loss = torch.mean(rayleigh_quotients)
