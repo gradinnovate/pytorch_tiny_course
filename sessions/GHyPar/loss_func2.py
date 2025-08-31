@@ -74,48 +74,63 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         return torch.stack(partitions)
 
     def _contrastive_partition_loss(self, Z: torch.Tensor, hyperedge_index: torch.Tensor, 
-                                   num_nodes: int, cut_size_func=None, temperature: float = 0.1) -> torch.Tensor:
-        """對比學習：區分好的和壞的 partition"""
-        # 如果沒有提供 cut size 函數，回退到簡單損失
-        if cut_size_func is None:
+                                   num_nodes: int, hint_partition: torch.Tensor = None, 
+                                   cut_size_func=None, temperature: float = 0.1) -> torch.Tensor:
+        """對比學習：驗證後的 hint partition (好的) vs 隨機 partition (壞的)"""
+        if hint_partition is None or cut_size_func is None:
             return torch.tensor(0.0, device=Z.device)
-            
-        # 生成多個 partition 樣本
-        partitions = self._generate_partition_samples(Z, hyperedge_index, num_samples=8)
         
-        # 計算每個 partition 的 cut size
+        # 生成多個隨機 balanced partitions
+        random_partitions = []
+        for _ in range(5):  # 生成 5 個隨機樣本
+            random_partition = self._generate_random_balanced_partition(num_nodes, Z.device)
+            random_partitions.append(random_partition.squeeze())
+        
+        # 計算所有 partition 的 cut size (包括 hint)
         hyperedge_index_cpu = hyperedge_index.cpu()
-        cut_sizes = []
-        for partition in partitions:
-            # 確保 partition 在 CPU 上
-            partition_cpu = partition.cpu()
-            cut_size = cut_size_func(partition_cpu, hyperedge_index_cpu, num_nodes)
-            cut_sizes.append(cut_size)
+        hint_cut_size = cut_size_func(hint_partition.cpu(), hyperedge_index_cpu, num_nodes)
         
-        cut_sizes = torch.tensor(cut_sizes, device=Z.device, dtype=torch.float)
+        random_cut_sizes = []
+        for rp in random_partitions:
+            cut_size = cut_size_func(rp.cpu(), hyperedge_index_cpu, num_nodes)
+            random_cut_sizes.append(cut_size)
         
-        # 找到最好和最壞的 partition
-        best_idx = torch.argmin(cut_sizes)
-        worst_idx = torch.argmax(cut_sizes)
+        # 找到比 hint 更差的隨機 partition
+        worse_partitions = []
+        for i, cut_size in enumerate(random_cut_sizes):
+            if cut_size > hint_cut_size:  # 只用確實更差的作為負樣本
+                worse_partitions.append(random_partitions[i])
         
-        # 計算 embedding 相似度
-        best_partition = partitions[best_idx].float().unsqueeze(1)
-        worst_partition = partitions[worst_idx].float().unsqueeze(1)
+        if not worse_partitions:
+            # 如果沒有更差的，回退到 0 loss
+            return torch.tensor(0.0, device=Z.device)
+        
+        # 使用最差的作為負樣本
+        worst_idx = max(range(len(random_cut_sizes)), key=lambda i: random_cut_sizes[i])
+        bad_partition = random_partitions[worst_idx].unsqueeze(1)
+        good_partition = hint_partition.float().unsqueeze(1)
         
         # 使用 cosine similarity
         z_norm = F.normalize(Z, dim=0)
-        best_sim = torch.sum(z_norm * F.normalize(best_partition, dim=0))
-        worst_sim = torch.sum(z_norm * F.normalize(worst_partition, dim=0))
+        good_sim = torch.sum(z_norm * F.normalize(good_partition, dim=0))
+        bad_sim = torch.sum(z_norm * F.normalize(bad_partition, dim=0))
         
-        # 對比損失：好的 partition 應該與 embedding 更相似
-        contrastive_loss = -torch.log(torch.exp(best_sim / temperature) / 
-                                     (torch.exp(best_sim / temperature) + torch.exp(worst_sim / temperature) + 1e-8))
+        # 對比損失：hint partition 應該與 embedding 更相似
+        contrastive_loss = -torch.log(torch.exp(good_sim / temperature) / 
+                                     (torch.exp(good_sim / temperature) + torch.exp(bad_sim / temperature) + 1e-8))
         
         return contrastive_loss
+    
+    def _generate_random_balanced_partition(self, num_nodes: int, device: torch.device) -> torch.Tensor:
+        """生成隨機的 balanced partition 作為負樣本"""
+        # 隨機分配，但保持 balanced (50-50 split)
+        partition = torch.randperm(num_nodes, device=device)
+        partition = (partition < num_nodes // 2).float().unsqueeze(1)
+        return partition
 
     def forward(self, Z: torch.Tensor, hyperedge_index: torch.Tensor, 
                 num_nodes: int, mu: torch.Tensor = None, logvar: torch.Tensor = None, 
-                cut_size_func=None) -> torch.Tensor:
+                hint_partition: torch.Tensor = None, cut_size_func=None) -> torch.Tensor:
         """
         計算 Loss。
 
@@ -188,8 +203,8 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         # 主要損失：所有瑞利商的均值
         rayleigh_loss = torch.mean(rayleigh_quotients)
         
-        # 對比學習損失：學會區分好的和壞的 partition
-        contrastive_loss = self._contrastive_partition_loss(Z, hyperedge_index, num_nodes, cut_size_func)
+        # 對比學習損失：驗證 hint 確實比隨機好
+        contrastive_loss = self._contrastive_partition_loss(Z, hyperedge_index, num_nodes, hint_partition, cut_size_func)
         
         # VAE 的 KL 散度項（如果提供了 mu 和 logvar）
         kl_loss = 0.0

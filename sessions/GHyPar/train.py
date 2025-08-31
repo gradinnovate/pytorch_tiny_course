@@ -26,7 +26,7 @@ from loss_func2 import HypergraphRayleighQuotientLossGeneralized as HypergraphRa
 DEFAULT_SEED = 42
 DEFAULT_EPSILON = 0.02
 DEFAULT_NUM_EPOCHS = 500  # 進一步減少 epochs
-DEFAULT_LR = 0.0001  # 中等學習率平衡穩定性和學習效果
+DEFAULT_LR = 0.00001  # 中等學習率平衡穩定性和學習效果
 DEFAULT_HIDDEN_DIM = 16   # 降低模型複雜度
 
 def set_random_seeds(seed: int = DEFAULT_SEED) -> None:
@@ -230,6 +230,7 @@ def train_model_multi_sample(model: HypergraphModel,
                            hyperedge_index: torch.Tensor,
                            hyperedge_weights: torch.Tensor,
                            num_vertices: int,
+                           solutions: List[Tuple[torch.Tensor, Dict[str, Any]]],
                            num_epochs: int = DEFAULT_NUM_EPOCHS,
                            lr: float = DEFAULT_LR) -> Tuple[torch.Tensor, float]:
     """
@@ -241,6 +242,9 @@ def train_model_multi_sample(model: HypergraphModel,
     Returns:
         Tuple of (final_embeddings, final_loss)
     """
+    # Get device from model
+    device = next(model.parameters()).device
+    
     criterion = HypergraphRayleighQuotientLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
@@ -266,11 +270,14 @@ def train_model_multi_sample(model: HypergraphModel,
             if isinstance(model_output, tuple):
                 # Variational model
                 output, mu, logvar = model_output
-                loss = criterion(output, hyperedge_index, num_vertices, mu, logvar, calculate_cut_size)
+                # 使用當前 sample 的 partition 作為 hint (好的樣本)
+                current_partition = solutions[sample_idx][1]['ground_truth_partition'].to(device)
+                loss = criterion(output, hyperedge_index, num_vertices, mu, logvar, current_partition, calculate_cut_size)
             else:
                 # Standard model
                 output = model_output
-                loss = criterion(output, hyperedge_index, num_vertices, cut_size_func=calculate_cut_size)
+                current_partition = solutions[sample_idx][1]['ground_truth_partition'].to(device)
+                loss = criterion(output, hyperedge_index, num_vertices, hint_partition=current_partition, cut_size_func=calculate_cut_size)
             
             # Backward pass
             loss.backward()
@@ -344,7 +351,7 @@ def train_hypergraph_model(num_epochs: int = DEFAULT_NUM_EPOCHS,
     
     # Create and train model - input_dim=3 (noisy partition + degree + position)
     model = HypergraphModel(input_dim=3, hidden_dim=DEFAULT_HIDDEN_DIM, output_dim=1).to(device)
-    trained_model, final_loss = train_model_multi_sample(model, features_list, hyperedge_index, hyperedge_weights, num_vertices, num_epochs, lr)
+    trained_model, final_loss = train_model_multi_sample(model, features_list, hyperedge_index, hyperedge_weights, num_vertices, solutions, num_epochs, lr)
     
     # Load evaluation data (ibm01.part.2)
     print("\n" + "="*50)
