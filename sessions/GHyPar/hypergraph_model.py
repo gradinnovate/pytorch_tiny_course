@@ -9,11 +9,12 @@ class HypergraphModel(nn.Module):
     超圖譜嵌入的 GNN 模型，專為超圖二分割任務設計。
 
     架構特點：
-    - 3層 HypergraphConv：input_dim -> hidden_dim -> hidden_dim -> output_dim
+    - 3層 HypergraphConv with multi-head attention：input_dim -> hidden_dim -> hidden_dim -> output_dim
     - 第一層後使用 LayerNorm 穩定訓練
     - 使用 LeakyReLU 激活函數避免死神經元
     - Dropout 正則化防止過擬合  
     - 可學習的 mask token 增強泛化能力
+    - Single-head attention for all layers
     - 最終層無激活函數，直接輸出嵌入向量
     
     當前實現：
@@ -41,15 +42,26 @@ class HypergraphModel(nn.Module):
         """
         super().__init__()
         
-        # 超圖卷積層
-        self.conv1 = HypergraphConv(input_dim, hidden_dim)      # 第一層：input -> hidden
+        # 超圖卷積層 with attention
+        self.conv1 = HypergraphConv(input_dim, hidden_dim, use_attention=False, heads=1)      # 第一層：input -> hidden
         self.norm1 = LayerNorm(hidden_dim)                     # 層正規化穩定訓練
         
-        self.conv2 = HypergraphConv(hidden_dim, hidden_dim)     # 第二層：hidden -> hidden
+        self.conv2 = HypergraphConv(hidden_dim, hidden_dim, use_attention=False, heads=1)     # 第二層：hidden -> hidden
         
         # Variational layers: 輸出均值和對數方差
-        self.conv_mu = HypergraphConv(hidden_dim, output_dim)    # 均值分支
-        self.conv_logvar = HypergraphConv(hidden_dim, output_dim) # 對數方差分支
+        self.conv_mu = HypergraphConv(hidden_dim, hidden_dim)    # 均值分支
+        self.conv_logvar = HypergraphConv(hidden_dim, hidden_dim) # 對數方差分支
+        
+        # 3-layer MLP decoder for final embedding refinement
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 8),
+            nn.LeakyReLU(), 
+            nn.Dropout(dropout),
+            nn.Linear(8, output_dim)
+        )
         
         # 訓練參數
         self.dropout = dropout
@@ -81,7 +93,7 @@ class HypergraphModel(nn.Module):
             x = x.clone()  # 創建副本避免修改原始輸入
             x[mask] = self.mask_token.to(x.device)
         
-        # 第一層：超圖卷積 + 正規化 + 激活 + Dropout
+        # 第一層：超圖卷積 + 正規化 + 激活 + Dropout  
         x = self.conv1(x, hyperedge_index)
         x = self.norm1(x)
         x = F.leaky_relu(x)
@@ -106,9 +118,13 @@ class HypergraphModel(nn.Module):
             # 推理時也返回 mu 作為預設嵌入，但保留採樣能力
             z = mu
         
+        # 3-layer MLP decoder for final refinement
+        z_decoded = self.decoder(z)
+        mu_decoded = self.decoder(mu)
+        
         # QR Decomposition for orthogonal embeddings
-        z_orth = self._apply_qr_orthogonalization(z)
-        mu_orth = self._apply_qr_orthogonalization(mu)
+        z_orth = self._apply_qr_orthogonalization(z_decoded)
+        mu_orth = self._apply_qr_orthogonalization(mu_decoded)
         
         # 始終返回 (z, mu, logvar) 以支持推理時的手動採樣
         return z_orth, mu_orth, logvar

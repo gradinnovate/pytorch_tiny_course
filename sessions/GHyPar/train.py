@@ -25,9 +25,9 @@ from loss_func2 import HypergraphRayleighQuotientLossGeneralized as HypergraphRa
 # Constants
 DEFAULT_SEED = 42
 DEFAULT_EPSILON = 0.02
-DEFAULT_NUM_EPOCHS = 500  # 進一步減少 epochs
-DEFAULT_LR = 0.00001  # 中等學習率平衡穩定性和學習效果
-DEFAULT_HIDDEN_DIM = 16   # 降低模型複雜度
+DEFAULT_NUM_EPOCHS = 1000  # 進一步減少 epochs
+DEFAULT_LR = 0.0000025  # 中等學習率平衡穩定性和學習效果
+DEFAULT_HIDDEN_DIM = 256   # 降低模型複雜度
 
 def set_random_seeds(seed: int = DEFAULT_SEED) -> None:
     """Set random seeds for reproducibility across all libraries."""
@@ -272,12 +272,12 @@ def train_model_multi_sample(model: HypergraphModel,
                 output, mu, logvar = model_output
                 # 使用當前 sample 的 partition 作為 hint (好的樣本)
                 current_partition = solutions[sample_idx][1]['ground_truth_partition'].to(device)
-                loss = criterion(output, hyperedge_index, num_vertices, mu, logvar, current_partition, calculate_cut_size)
+                loss = criterion(output, hyperedge_index, num_vertices, mu, logvar, current_partition)
             else:
                 # Standard model
                 output = model_output
                 current_partition = solutions[sample_idx][1]['ground_truth_partition'].to(device)
-                loss = criterion(output, hyperedge_index, num_vertices, hint_partition=current_partition, cut_size_func=calculate_cut_size)
+                loss = criterion(output, hyperedge_index, num_vertices, hint_partition=current_partition)
             
             # Backward pass
             loss.backward()
@@ -515,10 +515,11 @@ def partition_by_even_split(embeddings: torch.Tensor,
     Simple even partition (50/50 split) based on embedding median.
     """
     num_nodes = embeddings.shape[0]
-    embeddings_flat = embeddings.flatten()
+    # Use only the first column for sorting (don't flatten all dimensions)
+    embeddings_first_col = embeddings[:, 0] if embeddings.dim() > 1 else embeddings.squeeze()
     
     # Convert to numpy for processing
-    embeddings_np = embeddings_flat.cpu().numpy()
+    embeddings_np = embeddings_first_col.cpu().numpy()
     
     # Sort nodes by embedding values
     sorted_indices = np.argsort(embeddings_np)
@@ -549,7 +550,8 @@ def partition_by_balanced_cut(embeddings: torch.Tensor,
         partition: Binary partition tensor (0 or 1 for each node)
     """
     num_nodes = embeddings.shape[0]
-    embeddings_flat = embeddings.flatten()
+    # Use only the first column for partitioning (don't flatten all dimensions)
+    embeddings_flat = embeddings[:, 0] if embeddings.dim() > 1 else embeddings.squeeze()
     
     # Convert to numpy for Numba
     embeddings_np = embeddings_flat.cpu().numpy()

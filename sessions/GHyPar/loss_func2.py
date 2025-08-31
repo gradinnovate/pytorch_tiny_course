@@ -105,17 +105,23 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
             # 如果沒有更差的，回退到 0 loss
             return torch.tensor(0.0, device=Z.device)
         
-        # 使用最差的作為負樣本
+        # 方法1：通過 Z 生成 partition，再與 hint 和隨機 partition 比較
+        
+        # 用 embedding 生成 predicted partition
+        predicted_partition = (torch.sigmoid(Z.squeeze()) > 0.5).float()
+        
+        # 好的樣本：hint partition  
+        good_partition = hint_partition.float()
+        
+        # 使用最差的隨機 partition 作為負樣本
         worst_idx = max(range(len(random_cut_sizes)), key=lambda i: random_cut_sizes[i])
-        bad_partition = random_partitions[worst_idx].unsqueeze(1)
-        good_partition = hint_partition.float().unsqueeze(1)
+        bad_partition = random_partitions[worst_idx].float()
         
-        # 使用 cosine similarity
-        z_norm = F.normalize(Z, dim=0)
-        good_sim = torch.sum(z_norm * F.normalize(good_partition, dim=0))
-        bad_sim = torch.sum(z_norm * F.normalize(bad_partition, dim=0))
+        # 計算 partition 之間的相似度
+        good_sim = F.cosine_similarity(predicted_partition.unsqueeze(0), good_partition.unsqueeze(0))
+        bad_sim = F.cosine_similarity(predicted_partition.unsqueeze(0), bad_partition.unsqueeze(0))
         
-        # 對比損失：hint partition 應該與 embedding 更相似
+        # 對比損失：predicted partition 應該更接近 hint partition
         contrastive_loss = -torch.log(torch.exp(good_sim / temperature) / 
                                      (torch.exp(good_sim / temperature) + torch.exp(bad_sim / temperature) + 1e-8))
         
