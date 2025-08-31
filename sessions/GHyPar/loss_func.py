@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-class HypergraphRayleighQuotientLossDirect(nn.Module):
+class HypergraphRayleighQuotientLoss(nn.Module):
     """
     基於 NIPS 論文的歸一化超圖 Laplacian 標準瑞利商 Loss Function。
 
@@ -45,7 +45,7 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
 
 
     def forward(self, Z: torch.Tensor, hyperedge_index: torch.Tensor, 
-                num_nodes: int, hyperedge_weight: torch.Tensor = None) -> torch.Tensor:
+                num_nodes: int) -> torch.Tensor:
         """
         計算 Loss。
 
@@ -53,7 +53,6 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
             Z (torch.Tensor): GNN 輸出的節點嵌入, shape 為 (num_nodes, k)。
             hyperedge_index (torch.Tensor): 超圖的關聯索引。
             num_nodes (int): 圖中的節點數量。
-            hyperedge_weight (torch.Tensor, optional): 超邊的權重。
 
         Returns:
             torch.Tensor: 一個標量 (scalar) 的 Loss 值。
@@ -63,14 +62,14 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
         num_hyperedges = (edge_idx.max() + 1).item()
 
         # --- 步驟 1: 預計算節點度和超邊度 ---
-        if hyperedge_weight is None:
-            hyperedge_weight = torch.ones(num_hyperedges, device=Z.device)
+        # 使用單位權重 w(e) = 1 for all hyperedges
+        hyperedge_weight = torch.ones(num_hyperedges, device=Z.device)
         
-        edge_weights_expanded = hyperedge_weight[edge_idx]
-        
+        # 計算節點度數: d(v) = 節點 v 連接的超邊數量
         Dv = torch.zeros(num_nodes, device=Z.device)
-        Dv.scatter_add_(0, node_idx, edge_weights_expanded)
+        Dv.scatter_add_(0, node_idx, torch.ones_like(node_idx, dtype=torch.float))
         
+        # 計算超邊度數: δ(e) = 超邊 e 包含的節點數量  
         De = torch.zeros(num_hyperedges, device=Z.device)
         De.scatter_add_(0, edge_idx, torch.ones_like(edge_idx, dtype=torch.float))
 
@@ -106,7 +105,10 @@ class HypergraphRayleighQuotientLossDirect(nn.Module):
         
         rayleigh_quotients = torch.stack(rayleigh_quotients)
         
-        # 損失是所有瑞利商的均值
-        loss = torch.mean(rayleigh_quotients)
+        # 主要損失：瑞利商的均值
+        rayleigh_loss = torch.mean(rayleigh_quotients)
+        
+        
+        loss = rayleigh_loss
         
         return loss

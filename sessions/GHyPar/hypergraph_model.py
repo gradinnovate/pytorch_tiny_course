@@ -6,83 +6,151 @@ from torch_geometric.nn import HypergraphConv, LayerNorm, BatchNorm
 
 class HypergraphModel(nn.Module):
     """
-    一個為學習超圖頻譜嵌入而優化的、更穩健的 GNN 架構。
+    超圖譜嵌入的 GNN 模型，專為超圖二分割任務設計。
 
-    - 採用 2 層結構以避免過度平滑。
-    - 在每個隱藏層後使用 LayerNorm, LeakyReLU, 和 Dropout，確保訓練穩定性。
-    - 輸出層為線性，不加激活函數，適用於嵌入任務。
-    - 包含可學習的 mask token，訓練時隨機遮蔽節點特徵以增強泛化能力。
+    架構特點：
+    - 3層 HypergraphConv：input_dim -> hidden_dim -> hidden_dim -> output_dim
+    - 第一層後使用 LayerNorm 穩定訓練
+    - 使用 LeakyReLU 激活函數避免死神經元
+    - Dropout 正則化防止過擬合  
+    - 可學習的 mask token 增強泛化能力
+    - 最終層無激活函數，直接輸出嵌入向量
+    
+    當前實現：
+    - 採用 Variational 架構，輸出均值和方差
+    - 訓練時使用重參數化技巧進行隨機採樣
+    - 推理時返回均值，但保留 mu 和 logvar 供手動採樣
+    - 支援推理時多次採樣以獲得多個解
+    - 適合小規模隱藏維度 (如 hidden_dim=8)
+    
+    用途：
+    - 學習超圖的低維嵌入表示
+    - 配合瑞利商 loss function 進行譜聚類
+    - 生成適合平衡二分割的節點嵌入
     """
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.5, mask_prob: float = 0.0):
+        """
+        初始化超圖模型。
+        
+        Args:
+            input_dim (int): 輸入節點特徵維度
+            hidden_dim (int): 隱藏層維度
+            output_dim (int): 輸出嵌入維度 (通常為1用於二分割)
+            dropout (float): Dropout 比例，預設0.5
+            mask_prob (float): 訓練時節點遮蔽比例，預設0.5
+        """
         super().__init__()
         
-        # 第一層：輸入維度 -> 隱藏維度
-        self.conv1 = HypergraphConv(input_dim, hidden_dim)
-        self.norm1 = LayerNorm(hidden_dim)
+        # 超圖卷積層
+        self.conv1 = HypergraphConv(input_dim, hidden_dim)      # 第一層：input -> hidden
+        self.norm1 = LayerNorm(hidden_dim)                     # 層正規化穩定訓練
         
-       
-        self.conv2 = HypergraphConv(hidden_dim, hidden_dim)
-        self.conv3 = HypergraphConv(hidden_dim, hidden_dim)
+        self.conv2 = HypergraphConv(hidden_dim, hidden_dim)     # 第二層：hidden -> hidden
         
-        # MLP decoder for better representation learning
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim)
-        )
-       
+        # Variational layers: 輸出均值和對數方差
+        self.conv_mu = HypergraphConv(hidden_dim, output_dim)    # 均值分支
+        self.conv_logvar = HypergraphConv(hidden_dim, output_dim) # 對數方差分支
+        
+        # 訓練參數
         self.dropout = dropout
         self.mask_prob = mask_prob
         
-        # Learnable mask token
+        # 可學習的遮蔽標記，用於增強模型泛化能力
         self.mask_token = nn.Parameter(torch.randn(input_dim))
 
         # 初始化權重
         self._init_weights()
 
     def forward(self, x: torch.Tensor, hyperedge_index: torch.Tensor) -> torch.Tensor:
-        # Apply masking during training
+        """
+        前向傳播。
+        
+        Args:
+            x (torch.Tensor): 節點特徵矩陣 [num_nodes, input_dim]
+            hyperedge_index (torch.Tensor): 超邊索引 [2, num_edges]
+            
+        Returns:
+            torch.Tensor: 節點嵌入 [num_nodes, output_dim]
+        """
+        # 訓練時應用遮蔽機制增強泛化能力
         if self.training and self.mask_prob > 0:
-            # Create random mask
+            # 隨機選擇要遮蔽的節點
             mask = torch.rand(x.size(0), device=x.device) < self.mask_prob
             
-            # Replace masked nodes with mask token
-            x = x.clone()  # Create copy to avoid modifying input
+            # 用可學習的遮蔽標記替換選中的節點
+            x = x.clone()  # 創建副本避免修改原始輸入
             x[mask] = self.mask_token.to(x.device)
         
-        # 第一層
+        # 第一層：超圖卷積 + 正規化 + 激活 + Dropout
         x = self.conv1(x, hyperedge_index)
-        
         x = self.norm1(x)
-        x = F.relu(x)
+        x = F.leaky_relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         
-       
+        # 第二層：超圖卷積 + 激活 + Dropout
         x = self.conv2(x, hyperedge_index)
-        x = F.relu(x)
+        x = F.leaky_relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         
-        x = self.conv3(x, hyperedge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Variational layers: 計算均值和對數方差
+        mu = self.conv_mu(x, hyperedge_index)
+        logvar = self.conv_logvar(x, hyperedge_index)
         
-        # Apply MLP decoder
-        z = self.decoder(x)
+        # 重參數化技巧 (reparameterization trick)
+        if self.training:
+            # 訓練時進行隨機採樣
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+        else:
+            # 推理時也返回 mu 作為預設嵌入，但保留採樣能力
+            z = mu
         
+        # QR Decomposition for orthogonal embeddings
+        z_orth = self._apply_qr_orthogonalization(z)
+        mu_orth = self._apply_qr_orthogonalization(mu)
         
+        # 始終返回 (z, mu, logvar) 以支持推理時的手動採樣
+        return z_orth, mu_orth, logvar
+
+    def _apply_qr_orthogonalization(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        對embedding應用QR分解以獲得正交化的向量。
         
-        return z
+        Args:
+            embeddings: [num_nodes, output_dim]
+        
+        Returns:
+            正交化後的embeddings
+        """
+        if embeddings.shape[1] == 1:
+            # 對於單維輸出，直接標準化
+            return F.normalize(embeddings, dim=0, eps=1e-8)
+        else:
+            # 對於多維輸出，使用QR分解
+            Q, R = torch.linalg.qr(embeddings.T)  # 轉置後分解
+            
+            # 確保R對角線為正（標準化）
+            signs = torch.sign(torch.diag(R))
+            signs[signs == 0] = 1
+            Q = Q * signs.unsqueeze(0)
+            
+            return Q.T  # 轉回原始形狀
 
     def _init_weights(self):
-        """使用 Xavier/Glorot 初始化權重"""
+        """
+        初始化模型權重。
+        
+        使用 Xavier/Glorot 初始化權重矩陣，零初始化偏置項。
+        這有助於穩定訓練並避免梯度爆炸/消失問題。
+        """
         for name, param in self.named_parameters():
             if 'weight' in name:
-                # 對於權重矩陣
+                # 對於多維權重矩陣使用 Xavier 初始化
                 if param.dim() > 1:
                     nn.init.xavier_uniform_(param)
             elif 'bias' in name:
-                # 對於偏置項
+                # 偏置項初始化為零
                 nn.init.constant_(param, 0)
 
 if __name__ == "__main__":

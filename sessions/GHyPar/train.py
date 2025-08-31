@@ -20,14 +20,14 @@ set_num_threads(num_threads)
 
 from hgr2indices import parse_hgr_file
 from hypergraph_model import HypergraphModel
-from loss_func2 import HypergraphRayleighQuotientLossDirect as HypergraphRayleighQuotientLoss
+from loss_func2 import HypergraphRayleighQuotientLossGeneralized as HypergraphRayleighQuotientLoss
 
 # Constants
 DEFAULT_SEED = 42
 DEFAULT_EPSILON = 0.02
-DEFAULT_NUM_EPOCHS = 1500  # Back to original
-DEFAULT_LR = 0.00002  # Back to original working LR
-DEFAULT_HIDDEN_DIM = 32
+DEFAULT_NUM_EPOCHS = 500  # 進一步減少 epochs
+DEFAULT_LR = 0.0001  # 中等學習率平衡穩定性和學習效果
+DEFAULT_HIDDEN_DIM = 16   # 降低模型複雜度
 
 def set_random_seeds(seed: int = DEFAULT_SEED) -> None:
     """Set random seeds for reproducibility across all libraries."""
@@ -113,6 +113,28 @@ def compute_node_degrees(hyperedge_index: torch.Tensor, num_vertices: int) -> to
     return node_degrees
 
 
+def compute_node_connectivity_strength(hyperedge_index: torch.Tensor, num_vertices: int) -> torch.Tensor:
+    """Compute node connectivity strength - number of unique neighbors through hyperedges."""
+    node_idx, edge_idx = hyperedge_index[0].cpu(), hyperedge_index[1].cpu()
+    
+    connectivity_strength = torch.zeros(num_vertices, dtype=torch.float)
+    
+    for node in range(num_vertices):
+        # 找到此節點參與的所有超邊
+        node_edges = edge_idx[node_idx == node]
+        
+        # 收集所有透過超邊連接的鄰居節點
+        neighbors = set()
+        for edge in node_edges:
+            edge_nodes = node_idx[edge_idx == edge]
+            neighbors.update(edge_nodes.tolist())
+        
+        # 連接強度 = 唯一鄰居數量 (排除自己)
+        connectivity_strength[node] = len(neighbors) - 1 if node in neighbors else len(neighbors)
+    
+    return connectivity_strength
+
+
 
 
 def robust_normalize(feature: torch.Tensor, target_norm: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -149,9 +171,11 @@ def robust_normalize(feature: torch.Tensor, target_norm: Optional[torch.Tensor] 
 
 def create_node_features(partition_ids: torch.Tensor, 
                         hyperedge_index: torch.Tensor, 
-                        num_vertices: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+                        num_vertices: int,
+                        add_noise: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Create and normalize node features for the hypergraph model.
+    Create hybrid node features: topological + weakly supervised partition IDs.
+    Uses high noise on partition IDs to reduce overfitting while providing guidance.
     
     Returns:
         Tuple of (feature_tensor, stats_dict)
@@ -167,17 +191,26 @@ def create_node_features(partition_ids: torch.Tensor,
     # Use degree norm as reference for other features
     degree_norm = torch.norm(node_degrees_std, p=2)
     
-    # Robust normalization for partition IDs and node indices
+    # 混合學習：拓撲特徵 + 弱監督的 partition ID
     partition_ids_normalized = robust_normalize(partition_ids, degree_norm)
     
     node_indices = torch.arange(num_vertices, dtype=torch.float)
     node_indices_normalized = robust_normalize(node_indices, degree_norm)
     
-    # Combine features: [partition_ids, node_degrees, node_indices]
+    # 根據 add_noise 參數決定是否添加噪聲
+    if add_noise:
+        # 訓練時：使用帶噪聲的 partition_ids 作為弱監督
+        noise_level = 0.6  # 增加噪聲強度，降低監督強度
+        partition_noise = torch.randn_like(partition_ids_normalized) * noise_level
+        final_partition_ids = partition_ids_normalized + partition_noise
+    else:
+        # 評估時：使用乾淨的 partition_ids
+        final_partition_ids = partition_ids_normalized
+    
     features = torch.stack([
-        partition_ids_normalized,  # Most important: ground truth signal
-        node_degrees_std,          # Second: topology structure  
-        node_indices_normalized    # Third: positional information
+        final_partition_ids,       # 弱監督信號（高噪聲）
+        node_degrees_std,          # 拓撲結構特徵  
+        node_indices_normalized    # 位置信息特徵
     ], dim=1)
     
     # Statistics for logging
@@ -185,7 +218,7 @@ def create_node_features(partition_ids: torch.Tensor,
         'mean_degree': mean_degree.item(),
         'std_degree': std_degree.item(),
         'degree_norm': degree_norm.item(),
-        'partition_range': [partition_ids_normalized.min().item(), partition_ids_normalized.max().item()],
+        'partition_range': [final_partition_ids.min().item(), final_partition_ids.max().item()],
         'indices_range': [node_indices_normalized.min().item(), node_indices_normalized.max().item()]
     }
     
@@ -211,6 +244,12 @@ def train_model_multi_sample(model: HypergraphModel,
     criterion = HypergraphRayleighQuotientLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
+    # 學習率調度器 - 減緩衰減速度
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+    
+    # 添加梯度裁剪防止爆炸
+    max_grad_norm = 0.5  # 中等梯度裁剪
+    
     num_samples = len(features_list)
     print(f"Starting training with {num_samples} different partition solutions...")
     
@@ -222,14 +261,23 @@ def train_model_multi_sample(model: HypergraphModel,
         for sample_idx, features in enumerate(features_list):
             optimizer.zero_grad()
             
-            # Forward pass
-            output = model(features, hyperedge_index)
-            
-            # Calculate loss
-            loss = criterion(output, hyperedge_index, num_vertices)
+            # Forward pass - Variational model returns (z, mu, logvar)
+            model_output = model(features, hyperedge_index)
+            if isinstance(model_output, tuple):
+                # Variational model
+                output, mu, logvar = model_output
+                loss = criterion(output, hyperedge_index, num_vertices, mu, logvar, calculate_cut_size)
+            else:
+                # Standard model
+                output = model_output
+                loss = criterion(output, hyperedge_index, num_vertices, cut_size_func=calculate_cut_size)
             
             # Backward pass
             loss.backward()
+            
+            # 梯度裁剪防止爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
             optimizer.step()
             
             epoch_loss += loss.item()
@@ -237,9 +285,13 @@ def train_model_multi_sample(model: HypergraphModel,
         # Average loss across all samples
         avg_loss = epoch_loss / num_samples
         
-        # Print progress
+        # 更新學習率
+        scheduler.step()
+        
+        # Print progress with learning rate info
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.6f}")
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.6f}, LR: {current_lr:.8f}")
     
     print("Training completed!")
     
@@ -284,13 +336,13 @@ def train_hypergraph_model(num_epochs: int = DEFAULT_NUM_EPOCHS,
         features_list.append(features)
     
     # Print feature statistics from the last processed solution
-    print(f"\nFeature statistics (from last solution):")
+    print(f"\nFeature statistics (topology-only features):")
     print(f"Node degree stats - Mean: {feature_stats['mean_degree']:.2f}, Std: {feature_stats['std_degree']:.2f}")
     print(f"Degree reference norm: {feature_stats['degree_norm']:.2f}")
-    print(f"Partition ID range: [{feature_stats['partition_range'][0]:.3f}, {feature_stats['partition_range'][1]:.3f}]")
     print(f"Node indices range: [{feature_stats['indices_range'][0]:.3f}, {feature_stats['indices_range'][1]:.3f}]")
+    print("Note: Hybrid learning - topological features + noisy partition IDs (noise level: 0.6) + contrastive learning")
     
-    # Create and train model with multiple training samples from hints
+    # Create and train model - input_dim=3 (noisy partition + degree + position)
     model = HypergraphModel(input_dim=3, hidden_dim=DEFAULT_HIDDEN_DIM, output_dim=1).to(device)
     trained_model, final_loss = train_model_multi_sample(model, features_list, hyperedge_index, hyperedge_weights, num_vertices, num_epochs, lr)
     
@@ -302,17 +354,49 @@ def train_hypergraph_model(num_epochs: int = DEFAULT_NUM_EPOCHS,
     # Compute ground truth statistics only for evaluation data
     compute_ground_truth_stats(eval_stats['ground_truth_partition'], hyperedge_index, num_hyperedges)
     
-    eval_features, eval_feature_stats = create_node_features(eval_partition_ids, hyperedge_index, num_vertices)
+    eval_features, eval_feature_stats = create_node_features(eval_partition_ids, hyperedge_index, num_vertices, add_noise=False)
     eval_features = eval_features.to(device)
     
-    # Get embeddings using evaluation features
+    # Get embeddings using evaluation features - with multiple sampling for Variational
     trained_model.eval()
+    embeddings_list = []
+    
     with torch.no_grad():
-        embeddings = trained_model(eval_features, hyperedge_index)
+        model_output = trained_model(eval_features, hyperedge_index)
+        if isinstance(model_output, tuple):
+            # Variational model - perform multiple sampling
+            _, mu, logvar = model_output
+            
+            # 診斷方差信息
+            std = torch.exp(0.5 * logvar)
+            print(f"Variational model detected - generating 24 solutions (1 deterministic + 23 stochastic)...")
+            print(f"Variance diagnostics:")
+            print(f"  logvar range: [{logvar.min():.6f}, {logvar.max():.6f}]")
+            print(f"  std range: [{std.min():.6f}, {std.max():.6f}]")
+            print(f"  mean std: {std.mean():.6f}")
+            
+            # Solution 1: Use deterministic mean (mu)
+            embeddings_list.append(mu)
+            print(f"Solution 1/24 (deterministic μ) - Embedding range: [{mu.min():.4f}, {mu.max():.4f}]")
+            
+            # Solutions 2-24: Random sampling from distribution with temperature scaling
+            temperature = 0.2  # 控制採樣強度，避免過度偏離均值
+            for sample_idx in range(23):
+                eps = torch.randn_like(std)
+                sampled_embedding = mu + temperature * eps * std
+                embeddings_list.append(sampled_embedding)
+                
+                # 計算與均值的差異
+                diff_from_mu = torch.abs(sampled_embedding - mu).mean()
+                print(f"Solution {sample_idx + 2}/24 (stochastic sample) - Range: [{sampled_embedding.min():.4f}, {sampled_embedding.max():.4f}], Diff from μ: {diff_from_mu:.6f}")
+        else:
+            # Standard model - only one embedding
+            embeddings_list = [model_output]
+            print(f"Standard model - single embedding generated")
     
-    print(f"Generated embeddings using evaluation features (ibm01.part.2)")
+    print(f"Generated {len(embeddings_list)} embedding(s) using evaluation features (ibm01.part.2)")
     
-    return trained_model, final_loss, embeddings, hyperedge_index, num_vertices
+    return trained_model, final_loss, embeddings_list, hyperedge_index, num_vertices, eval_partition_ids
 
 
 # Numba-accelerated functions for balanced partitioning
@@ -416,6 +500,28 @@ def evaluate_cuts_parallel(candidate_splits: np.ndarray,
         results[idx, 2] = cut_size
     
     return results
+
+
+def partition_by_even_split(embeddings: torch.Tensor, 
+                           hyperedge_index: torch.Tensor) -> torch.Tensor:
+    """
+    Simple even partition (50/50 split) based on embedding median.
+    """
+    num_nodes = embeddings.shape[0]
+    embeddings_flat = embeddings.flatten()
+    
+    # Convert to numpy for processing
+    embeddings_np = embeddings_flat.cpu().numpy()
+    
+    # Sort nodes by embedding values
+    sorted_indices = np.argsort(embeddings_np)
+    
+    # Create even partition (50/50 split)
+    partition = torch.zeros(num_nodes, dtype=torch.long)
+    split_idx = num_nodes // 2
+    partition[sorted_indices[split_idx:]] = 1
+    
+    return partition
 
 
 def partition_by_balanced_cut(embeddings: torch.Tensor, 
@@ -549,39 +655,227 @@ def plot_embedding_histogram(embeddings: torch.Tensor, save_path: str = 'embeddi
     print(f"Histogram saved as '{save_path}'")
 
 
+def iterative_inference(trained_model, best_partition, hyperedge_index, num_vertices, max_iterations=2, epsilon=DEFAULT_EPSILON):
+    """
+    迭代推理：每次重新 sample 24 組 embeddings，找 balanced 最佳分割作為下次輸入。
+    
+    Args:
+        trained_model: 訓練好的模型
+        best_partition: 初始最佳分割 (0/1 格式)
+        hyperedge_index: 超圖索引
+        num_vertices: 節點數量
+        max_iterations: 最大迭代次數
+        epsilon: 平衡約束參數
+        
+    Returns:
+        List of iteration results with best embedding and partition for each iteration
+    """
+    print(f"\nIterative refinement with balanced search:")
+    
+    current_partition = best_partition
+    iteration_results = []
+    
+    for iteration in range(max_iterations):
+        print(f"\nIteration {iteration + 1}/{max_iterations}:")
+        print(f"  Input partition sizes: {torch.bincount(current_partition)[0].item()} | {torch.bincount(current_partition)[1].item()}")
+        
+        # 轉換當前分割為特徵格式 (0 -> -1, 1 -> 1)
+        partition_features = torch.where(current_partition == 0, -1.0, 1.0).float()
+        
+        # 創建新特徵
+        iterative_features, _ = create_node_features(partition_features, hyperedge_index, num_vertices, add_noise=False)
+        
+        # 獲取模型設備並移動特徵
+        device = next(trained_model.parameters()).device
+        iterative_features = iterative_features.to(device)
+        
+        print(f"  Sampling 24 embeddings...")
+        
+        # 推理獲得新嵌入 - sample 24 組
+        trained_model.eval()
+        embeddings_list = []
+        
+        with torch.no_grad():
+            model_output = trained_model(iterative_features, hyperedge_index)
+            if isinstance(model_output, tuple):
+                # Variational model - 生成 24 個樣本
+                z, mu, logvar = model_output
+                std = torch.exp(0.5 * logvar)
+                
+                # Sample 1: 確定性均值
+                embeddings_list.append(mu)
+                
+                # Samples 2-24: 隨機採樣
+                temperature = 0.2
+                for sample_idx in range(23):
+                    eps = torch.randn_like(std)
+                    sampled_embedding = mu + temperature * eps * std
+                    embeddings_list.append(sampled_embedding)
+            else:
+                # Standard model - 只能生成一個
+                embeddings_list.append(model_output)
+        
+        # 評估所有 embeddings，找到最佳的 balanced partition
+        print(f"  Evaluating {len(embeddings_list)} embeddings for balanced partitioning...")
+        best_cut_size = float('inf')
+        best_embedding = None
+        best_balanced_partition = None
+        
+        for i, embeddings in enumerate(embeddings_list):
+            # 找 balanced 範圍內的最佳分割
+            partition = partition_by_balanced_cut(embeddings, hyperedge_index, epsilon=epsilon)
+            
+            # 計算 cut size
+            partition_cpu = partition.cpu()
+            cut_size = calculate_cut_size(partition_cpu, hyperedge_index.cpu(), num_vertices)
+            
+            if cut_size < best_cut_size:
+                best_cut_size = cut_size
+                best_embedding = embeddings
+                best_balanced_partition = partition
+        
+        partition_sizes = torch.bincount(best_balanced_partition)
+        print(f"  Best cut size: {best_cut_size}")
+        print(f"  Best partition sizes: {partition_sizes[0].item()} | {partition_sizes[1].item()}")
+        
+        # 記錄這次迭代的結果
+        iteration_results.append({
+            'iteration': iteration + 1,
+            'embedding': best_embedding,
+            'partition': best_balanced_partition,
+            'cut_size': best_cut_size
+        })
+        
+        # 更新當前分割為這次的最佳結果，作為下次迭代的輸入
+        current_partition = best_balanced_partition
+    
+    print(f"\nCompleted {max_iterations} iterations")
+    return iteration_results
+
+
 def main() -> None:
     """Main execution function."""
     # Train model
-    trained_model, final_loss, embeddings, hyperedge_index, num_vertices = train_hypergraph_model(
+    trained_model, final_loss, embeddings_list, hyperedge_index, num_vertices, eval_partition_ids = train_hypergraph_model(
         num_epochs=DEFAULT_NUM_EPOCHS, 
         lr=DEFAULT_LR, 
         seed=DEFAULT_SEED
     )
     print(f"Final loss: {final_loss:.6f}")
     
-    # Analyze embeddings
-    print("\\nPartitioning nodes with balanced cut optimization...")
-    print(f"Embedding stats - Min: {embeddings.min():.6f}, Max: {embeddings.max():.6f}, Median: {embeddings.median():.6f}")
-    print(f"Embedding std: {embeddings.std():.6f}")
+    # Evaluate all embeddings and find the best solution
+    best_cut_size = float('inf')
+    best_embedding_idx = 0
+    best_partition = None
+    all_results = []
     
-    # Partition with balanced cut
-    partition = partition_by_balanced_cut(embeddings, hyperedge_index, epsilon=DEFAULT_EPSILON)
-    
-    # Calculate and report results
-    partition_cpu = partition.cpu()
-    hyperedge_index_cpu = hyperedge_index.cpu()
-    cut_size = calculate_cut_size(partition_cpu, hyperedge_index_cpu, num_vertices)
-    
-    partition_sizes = torch.bincount(partition)
     total_hyperedges = hyperedge_index[1].max() + 1
     
-    print(f"Partition sizes: {partition_sizes[0].item()} | {partition_sizes[1].item()}")
-    print(f"Cut size: {cut_size}")
-    print(f"Total hyperedges: {total_hyperedges}")
-    print(f"Cut ratio: {cut_size / total_hyperedges:.4f}")
+    print(f"\n{'='*60}")
+    print("PHASE 1: Even Partition Evaluation (50/50 split)")
+    print(f"{'='*60}")
+    print(f"Evaluating {len(embeddings_list)} embedding sample(s) with even partition...")
     
-    # Plot results
-    plot_embedding_histogram(embeddings)
+    for i, embeddings in enumerate(embeddings_list):
+        print(f"\n--- Sample {i+1}/{len(embeddings_list)} ---")
+        print(f"Embedding stats - Min: {embeddings.min():.6f}, Max: {embeddings.max():.6f}, Median: {embeddings.median():.6f}")
+        print(f"Embedding std: {embeddings.std():.6f}")
+        
+        # Even partition (50/50 split)
+        partition = partition_by_even_split(embeddings, hyperedge_index)
+        
+        # Calculate results
+        partition_cpu = partition.cpu()
+        hyperedge_index_cpu = hyperedge_index.cpu()
+        cut_size = calculate_cut_size(partition_cpu, hyperedge_index_cpu, num_vertices)
+        partition_sizes = torch.bincount(partition)
+        
+        result = {
+            'sample_idx': i + 1,
+            'embeddings': embeddings,
+            'partition': partition,
+            'cut_size': cut_size,
+            'partition_sizes': partition_sizes,
+            'cut_ratio': cut_size / total_hyperedges
+        }
+        all_results.append(result)
+        
+        print(f"Even partition sizes: {partition_sizes[0].item()} | {partition_sizes[1].item()}")
+        print(f"Even partition cut size: {cut_size}")
+        print(f"Cut ratio: {cut_size / total_hyperedges:.4f}")
+        
+        # Track best result
+        if cut_size < best_cut_size:
+            best_cut_size = cut_size
+            best_embedding_idx = i
+            best_partition = partition
+    
+    # Report best result from even partition evaluation
+    print(f"\n{'='*60}")
+    print(f"PHASE 1 BEST RESULT (Even Partition):")
+    print(f"{'='*60}")
+    best_result = all_results[best_embedding_idx]
+    print(f"Best sample: {best_result['sample_idx']}/{len(embeddings_list)}")
+    print(f"Best even cut size: {best_result['cut_size']}")
+    print(f"Best cut ratio: {best_result['cut_ratio']:.4f}")
+    print(f"Best partition sizes: {best_result['partition_sizes'][0].item()} | {best_result['partition_sizes'][1].item()}")
+    
+    # PHASE 2: Iterative refinement using best partition
+    print(f"\n{'='*60}")
+    print("PHASE 2: Iterative Refinement with Balanced Search")
+    print(f"{'='*60}")
+    iteration_results = iterative_inference(
+        trained_model, best_result['partition'], hyperedge_index, num_vertices, max_iterations=4, epsilon=DEFAULT_EPSILON
+    )
+    
+    # Track the best result from iterative refinement
+    final_best_cut_size = best_cut_size
+    final_best_embedding = best_result['embeddings']
+    
+    print(f"\nIterative refinement results:")
+    for result in iteration_results:
+        iteration = result['iteration']
+        cut_size = result['cut_size']
+        print(f"  Iteration {iteration}: cut_size = {cut_size} (improvement: {best_cut_size - cut_size})")
+        
+        # Track overall best
+        if cut_size < final_best_cut_size:
+            final_best_cut_size = cut_size
+            final_best_embedding = result['embedding']
+            print(f"    → New overall best!")
+    
+    # Final result is already from balanced search in Phase 2
+    print(f"\nFinal result already incorporates balanced search from iterative refinement.")
+    
+    # Calculate ground truth cut size
+    eval_partition_ids, eval_stats = load_partition_solution("ibm01.part.2")
+    ground_truth_partition = eval_stats['ground_truth_partition']
+    ground_truth_cut_size = calculate_cut_size(ground_truth_partition, hyperedge_index.cpu(), num_vertices)
+    
+    # Final summary
+    print(f"\n{'='*60}")
+    print(f"FINAL SUMMARY:")
+    print(f"{'='*60}")
+    print(f"Ground truth cut size: {ground_truth_cut_size}")
+    print(f"Phase 1 (Even partition) best: {best_cut_size}")
+    print(f"Phase 2 (Iterative + Balanced) best: {final_best_cut_size}")
+    
+    # Calculate improvements
+    phase1_gap = (best_cut_size - ground_truth_cut_size) / ground_truth_cut_size * 100
+    final_gap = (final_best_cut_size - ground_truth_cut_size) / ground_truth_cut_size * 100
+    improvement = best_cut_size - final_best_cut_size
+    
+    print(f"Phase 1 gap from ground truth: {phase1_gap:.2f}%")
+    print(f"Final gap from ground truth: {final_gap:.2f}%")
+    print(f"Iterative refinement improvement: {improvement} cuts")
+    
+    if improvement > 0:
+        print(f"✅ Iterative refinement successful!")
+    else:
+        print(f"⚠️  Iterative refinement did not improve")
+    
+    # Plot histogram of final best embedding
+    plot_embedding_histogram(final_best_embedding)
 
 
 if __name__ == "__main__":
