@@ -25,7 +25,7 @@ from loss_func2 import HypergraphRayleighQuotientLossGeneralized as HypergraphRa
 # Constants
 DEFAULT_SEED = 42
 DEFAULT_EPSILON = 0.02
-DEFAULT_NUM_EPOCHS = 1000  # 進一步減少 epochs
+DEFAULT_NUM_EPOCHS = 100  # 進一步減少 epochs
 DEFAULT_LR = 0.0000025  # 中等學習率平衡穩定性和學習效果
 DEFAULT_HIDDEN_DIM = 256   # 降低模型複雜度
 
