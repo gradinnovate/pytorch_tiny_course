@@ -25,8 +25,8 @@ from loss_func2 import HypergraphRayleighQuotientLossGeneralized as HypergraphRa
 # Constants
 DEFAULT_SEED = 42
 DEFAULT_EPSILON = 0.02
-DEFAULT_NUM_EPOCHS = 100  # 進一步減少 epochs
-DEFAULT_LR = 0.0000025  # 中等學習率平衡穩定性和學習效果
+DEFAULT_NUM_EPOCHS = 8000  # 進一步減少 epochs
+DEFAULT_LR = 0.00005  # 中等學習率平衡穩定性和學習效果
 DEFAULT_HIDDEN_DIM = 256   # 降低模型複雜度
 
 def set_random_seeds(seed: int = DEFAULT_SEED) -> None:
@@ -248,8 +248,7 @@ def train_model_multi_sample(model: HypergraphModel,
     criterion = HypergraphRayleighQuotientLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
-    # 學習率調度器 - 減緩衰減速度
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+    # 使用固定學習率，不使用調度器
     
     # 添加梯度裁剪防止爆炸
     max_grad_norm = 0.5  # 中等梯度裁剪
@@ -292,13 +291,9 @@ def train_model_multi_sample(model: HypergraphModel,
         # Average loss across all samples
         avg_loss = epoch_loss / num_samples
         
-        # 更新學習率
-        scheduler.step()
-        
-        # Print progress with learning rate info
+        # Print progress (固定學習率)
         if (epoch + 1) % 10 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.6f}, LR: {current_lr:.8f}")
+            print(f"Epoch [{epoch+1}/{num_epochs}], Avg Loss: {avg_loss:.6f}, LR: {lr:.8f}")
     
     print("Training completed!")
     

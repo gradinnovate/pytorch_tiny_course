@@ -111,36 +111,12 @@ class HypergraphModel(nn.Module):
         
        
         
-        # QR Decomposition for orthogonal embeddings
-        z_orth = self._apply_qr_orthogonalization(z)
-        mu_orth = self._apply_qr_orthogonalization(mu)
+        # 直接返回原始嵌入，不做正交化處理
+        # 移除 QR 分解以保持 Fiedler vector 的自然分佈
         
         # 始終返回 (z, mu, logvar) 以支持推理時的手動採樣
-        return z_orth, mu_orth, logvar
+        return z, mu, logvar
 
-    def _apply_qr_orthogonalization(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        對embedding應用QR分解以獲得正交化的向量。
-        
-        Args:
-            embeddings: [num_nodes, output_dim]
-        
-        Returns:
-            正交化後的embeddings
-        """
-        if embeddings.shape[1] == 1:
-            # 對於單維輸出，直接標準化
-            return F.normalize(embeddings, dim=0, eps=1e-8)
-        else:
-            # 對於多維輸出，使用QR分解
-            Q, R = torch.linalg.qr(embeddings.T)  # 轉置後分解
-            
-            # 確保R對角線為正（標準化）
-            signs = torch.sign(torch.diag(R))
-            signs[signs == 0] = 1
-            Q = Q * signs.unsqueeze(0)
-            
-            return Q.T  # 轉回原始形狀
 
     def _init_weights(self):
         """

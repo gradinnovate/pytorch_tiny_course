@@ -107,8 +107,9 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         
         # 方法1：通過 Z 生成 partition，再與 hint 和隨機 partition 比較
         
-        # 用 embedding 生成 predicted partition
-        predicted_partition = (torch.sigmoid(Z.squeeze()) > 0.5).float()
+        # 用 embedding 的第一列（Fiedler vector）生成 predicted partition
+        fiedler_vector = Z[:, 0] if Z.dim() > 1 and Z.shape[1] > 1 else Z.squeeze()
+        predicted_partition = (torch.sigmoid(fiedler_vector) > 0.5).float()
         
         # 好的樣本：hint partition  
         good_partition = hint_partition.float()
@@ -181,8 +182,9 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         for j in range(k):
             f = Z[:, j:j+1]  # 當前列向量
             
-            # 計算 f^T D_v f (廣義內積)
-            f_Dv_f = torch.sum(f.pow(2) * Dv.unsqueeze(1))
+            # 計算 f^T D_v f (廣義內積)  
+            # f: [num_nodes, 1], Dv: [num_nodes] -> 需要正確廣播
+            f_Dv_f = torch.sum(f.squeeze() * f.squeeze() * Dv)
             
             # 計算 f^T Θ f
             theta_quad_form = self._calculate_theta_quadratic_form(
@@ -209,6 +211,9 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         # 主要損失：所有瑞利商的均值
         rayleigh_loss = torch.mean(rayleigh_quotients)
         
+        # 添加 Fiedler vector 分離約束，防止退化為單峰
+        separation_loss = self._fiedler_separation_penalty(Z)
+        
         # 對比學習損失：驗證 hint 確實比隨機好
         contrastive_loss = self._contrastive_partition_loss(Z, hyperedge_index, num_nodes, hint_partition, cut_size_func)
         
@@ -223,11 +228,39 @@ class HypergraphRayleighQuotientLossGeneralized(nn.Module):
         # 組合損失 - 自監督學習
         lambda_contrastive = 0.01 # 對比學習權重
         lambda_kl = 0.001         # KL 散度權重 (降低)
+        lambda_separation = 0.1   # 分離約束權重
         
         loss = (rayleigh_loss + 
                 lambda_contrastive * contrastive_loss +
-                lambda_kl * kl_loss)
+                lambda_kl * kl_loss +
+                lambda_separation * separation_loss)
         
         
         
         return loss
+    
+    def _fiedler_separation_penalty(self, Z: torch.Tensor) -> torch.Tensor:
+        """
+        計算 Fiedler vector 分離約束，防止退化為單峰分佈。
+        鼓勵第一個維度（Fiedler vector）維持雙峰分佈。
+        """
+        fiedler_vector = Z[:, 0]  # 第一列作為 Fiedler vector
+        
+        # 計算正負值的均值分離度
+        pos_mask = fiedler_vector > 0
+        neg_mask = fiedler_vector < 0
+        
+        if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+            # 如果全為正或全為負，給予懲罰
+            return torch.tensor(1.0, device=Z.device)
+        
+        pos_mean = fiedler_vector[pos_mask].mean()
+        neg_mean = fiedler_vector[neg_mask].mean()
+        
+        # 分離度：正負均值的差距，越大越好
+        separation = torch.abs(pos_mean - neg_mean)
+        
+        # 懲罰項：分離度越小懲罰越大
+        penalty = 1.0 / (separation + 1e-6)
+        
+        return penalty
